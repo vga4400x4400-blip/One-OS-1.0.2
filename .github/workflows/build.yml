@@ -6,7 +6,7 @@ on:
       version:
         description: "OneOS version (without the leading v)"
         required: false
-        default: "1.0.3"
+        default: "1.0.4"
   push:
     tags:
       - "v*"
@@ -34,7 +34,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="${INPUT_VERSION:-1.0.3}"
+            VERSION="${INPUT_VERSION:-1.0.4}"
           fi
           VERSION="${VERSION#v}"
           echo "ONEOS_VERSION=${VERSION}" >> "${GITHUB_ENV}"
@@ -148,7 +148,7 @@ jobs:
             config/includes.chroot/etc/X11 \
             config/includes.chroot/etc/initramfs-tools/conf.d \
             config/includes.chroot/etc/sysctl.d \
-            config/includes.chroot/etc/systemd/system \
+            config/includes.chroot/etc/systemd/system/graphical.target.wants \
             config/includes.chroot/etc/xdg/autostart \
             config/includes.chroot/etc/sddm.conf.d \
             config/includes.chroot/usr/local/bin \
@@ -231,20 +231,37 @@ jobs:
           SingleClick=false
           KDEGLOBALS_EOF
 
-          # Permanent SDDM config (no autologin here: it is enabled only in the live session)
+          # SDDM config. The [Theme] section is (re)written by the chroot hook once it knows which
+          # greeter theme really got installed. No autologin here: it is enabled only in the live session.
           cat <<'SDDM_EOF' > config/includes.chroot/etc/sddm.conf.d/10-oneos-kde.conf
+          [General]
+          DisplayServer=x11
+
           [Theme]
           Current=breeze
           SDDM_EOF
 
-          # Live-session-only autologin, so installed systems keep a normal login screen
+          # Live-session-only autologin, so installed systems keep a normal login screen.
+          # The session file is detected at boot, so it works whichever Plasma session exists.
           cat <<'LIVE_AUTOLOGIN_EOF' > config/includes.chroot/usr/local/lib/oneos/live-autologin.sh
           #!/bin/sh
+          SESSION=""
+          for candidate in \
+            /usr/share/xsessions/plasmax11.desktop \
+            /usr/share/xsessions/plasma.desktop \
+            /usr/share/wayland-sessions/plasma.desktop; do
+            if [ -f "${candidate}" ]; then
+              SESSION="$(basename "${candidate}")"
+              break
+            fi
+          done
+          [ -n "${SESSION}" ] || SESSION="plasmax11.desktop"
+
           mkdir -p /etc/sddm.conf.d
-          cat > /etc/sddm.conf.d/20-oneos-live-autologin.conf <<'INNER_EOF'
+          cat > /etc/sddm.conf.d/20-oneos-live-autologin.conf <<INNER_EOF
           [Autologin]
           User=oneos
-          Session=plasmax11.desktop
+          Session=${SESSION}
           Relogin=false
           INNER_EOF
           LIVE_AUTOLOGIN_EOF
@@ -254,15 +271,20 @@ jobs:
           Description=OneOS live session autologin
           ConditionKernelCommandLine=boot=live
           After=live-config.service
+          Wants=live-config.service
           Before=display-manager.service sddm.service
 
           [Service]
           Type=oneshot
-          ExecStart=/usr/local/lib/oneos/live-autologin.sh
+          ExecStart=/bin/sh /usr/local/lib/oneos/live-autologin.sh
 
           [Install]
           WantedBy=graphical.target
           LIVE_UNIT_EOF
+
+          # Enable the autologin unit directly (does not depend on systemctl working inside the chroot)
+          ln -sf /etc/systemd/system/oneos-live-autologin.service \
+            config/includes.chroot/etc/systemd/system/graphical.target.wants/oneos-live-autologin.service
 
           # Kvantum translucent config for Liquid Glass mode
           cat <<'KV_GLASS_EOF' > config/includes.chroot/usr/share/Kvantum/OneOSGlass/OneOSGlass.kvconfig
@@ -425,8 +447,10 @@ jobs:
           dbus-send --session --dest=org.kde.KWin --type=method_call /KWin org.kde.KWin.reconfigure >/dev/null 2>&1 || true
           VISUAL_SH_EOF
 
-          # Verified package list for Debian 13 (Trixie), amd64 only (i386 Wine is installed in the hook)
+          # Verified package list for Debian 13 (Trixie), amd64 only (i386 Wine is installed in the hook).
           # NOTE: on Trixie the Spectacle screenshot package is called "kde-spectacle", not "spectacle".
+          # Packages whose exact Trixie name is uncertain (SDDM theme, QML6 modules) are installed
+          # one by one in the chroot hook, so a wrong name cannot abort the whole build.
           cat <<'PKG_LIST_EOF' > config/package-lists/custom.list.chroot
           live-boot
           live-config
@@ -451,6 +475,8 @@ jobs:
           plasma-workspace
           kwin-x11
           sddm
+          breeze
+          systemsettings
           konsole
           dolphin
           kate
@@ -2396,7 +2422,8 @@ jobs:
           SHORTCUTS_EOF
 
           # ------------------------------------------------------------------
-          # Chroot hook: multi-arch Wine, Brave, wallpapers, services, XFCE purge, size cleanup
+          # Chroot hook: SDDM theme + QML runtime, multi-arch Wine, Brave, wallpapers, services,
+          # XFCE purge, build-time sanity checks, size cleanup
           # ------------------------------------------------------------------
           cat <<'HOOK_EOF' > config/hooks/normal/0500-oneos-customization.hook.chroot
           #!/usr/bin/env bash
@@ -2405,9 +2432,66 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           APT_OPTS=(-y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
+          # Install packages one by one so a single wrong/missing name never aborts the build
+          try_install() {
+            local pkg
+            for pkg in "$@"; do
+              if apt-get install "${APT_OPTS[@]}" --no-install-recommends "${pkg}"; then
+                echo "[OneOS] installed ${pkg}"
+              else
+                echo "[OneOS] WARNING: could not install ${pkg}"
+              fi
+            done
+          }
+
           dpkg --add-architecture i386
           apt-get update
 
+          # ---- Login screen (SDDM) -------------------------------------------------------
+          # The image is built with --apt-recommends false, which drops the SDDM greeter theme
+          # and the Qt6 QML modules it needs. Without them SDDM shows a blank, broken screen.
+          try_install \
+            sddm-theme-breeze \
+            sddm-theme-debian-breeze \
+            kde-config-sddm \
+            qt6-wayland \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts \
+            qml6-module-qtquick-window \
+            qml6-module-qtquick-templates \
+            qml6-module-qtqml \
+            qml6-module-qtqml-workerscript \
+            qml6-module-qt5compat-graphicaleffects \
+            qml6-module-org-kde-kirigami \
+            breeze-cursor-theme \
+            breeze-icon-theme \
+            kwin-wayland \
+            xserver-xorg-video-vmware
+
+          # Pick whichever SDDM theme actually exists
+          SDDM_THEME=""
+          for theme in breeze debian-breeze maldives; do
+            if [ -f "/usr/share/sddm/themes/${theme}/Main.qml" ]; then
+              SDDM_THEME="${theme}"
+              break
+            fi
+          done
+          echo "[OneOS] SDDM theme selected: ${SDDM_THEME:-none}"
+          ls -la /usr/share/sddm/themes/ || true
+
+          mkdir -p /etc/sddm.conf.d
+          {
+            echo "[General]"
+            echo "DisplayServer=x11"
+            echo
+            echo "[Theme]"
+            echo "Current=${SDDM_THEME:-breeze}"
+            echo "CursorTheme=breeze_cursors"
+          } > /etc/sddm.conf.d/10-oneos-kde.conf
+          rm -f /etc/sddm.conf
+
+          # ---- Windows compatibility -----------------------------------------------------
           apt-get install "${APT_OPTS[@]}" --no-install-recommends \
             wine \
             wine64 \
@@ -2491,6 +2575,30 @@ jobs:
           echo "RESUME=none" > /etc/initramfs-tools/conf.d/resume
           update-initramfs -u -k all || true
 
+          # ---- Build-time sanity checks: fail the build instead of shipping a broken login screen
+          echo "[OneOS] Verifying the login stack..."
+          FAIL=0
+          if ! ls /usr/lib/x86_64-linux-gnu/qt6/qml/QtQuick/Controls >/dev/null 2>&1; then
+            echo "[OneOS] ERROR: Qt6 QtQuick.Controls QML module is missing (SDDM cannot draw its greeter)"
+            FAIL=1
+          fi
+          if [ -z "${SDDM_THEME}" ]; then
+            echo "[OneOS] ERROR: no SDDM theme was installed"
+            FAIL=1
+          fi
+          if [ ! -x /usr/sbin/sddm ] || [ ! -x /usr/libexec/sddm-helper ] && [ ! -x /usr/lib/x86_64-linux-gnu/sddm/sddm-helper ]; then
+            echo "[OneOS] WARNING: sddm helper binary not found at the usual paths"
+          fi
+          if ! ls /usr/share/xsessions/plasma*.desktop /usr/share/wayland-sessions/plasma*.desktop >/dev/null 2>&1; then
+            echo "[OneOS] ERROR: no Plasma session files were installed"
+            FAIL=1
+          fi
+          ls /usr/share/xsessions/ /usr/share/wayland-sessions/ 2>/dev/null || true
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "[OneOS] Login stack verification failed."
+            exit 1
+          fi
+
           apt-get autoremove -y --purge || true
           apt-get clean
           rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /tmp/*
@@ -2562,6 +2670,10 @@ jobs:
             - **Circle to Search (`Super + Shift + C`):** draw freely around anything on screen, then ask Gemini about it.
             - **Two visual profiles:** ✨ Liquid Glass (KWin blur, translucent apps, aurora wallpaper) and ⚡ Sleek Obsidian (matte, zero GPU overhead), switchable live without logging out.
             - **Out-of-the-box polish:** Inter font, Papirus-Dark icons, blue accent, audio, Bluetooth, Wi-Fi, Flatpak/Flathub and Software Center.
+
+            ### Fixed in this release
+            - **Login screen:** the SDDM greeter theme and its Qt6 QML modules are now installed explicitly, the theme is auto-selected, and the build fails early if the login stack is incomplete.
+            - **Live autologin:** the session file is detected at boot (X11 first, which is the most reliable choice in virtual machines) and the service is enabled directly in the image.
 
             ### Included
             - KDE Plasma (`sddm`, `kwin-x11`, `dolphin`, `konsole`, Kvantum) with XFCE fully removed
