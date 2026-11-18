@@ -1,4 +1,4 @@
-name: Build OneOS v1.0.1 Live ISO
+name: Build OneOS v1.0.2 Live ISO
 
 on:
   workflow_dispatch:
