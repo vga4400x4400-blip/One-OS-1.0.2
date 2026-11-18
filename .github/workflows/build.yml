@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v1.0.1'
+      - 'v1.0.2'
 
 permissions:
   contents: write
 
 jobs:
   build-iso:
-    name: Compile OneOS v1.0.1 (Debian 13 Trixie amd64)
+    name: Compile OneOS v1.0.2 (Debian 13 Trixie amd64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
