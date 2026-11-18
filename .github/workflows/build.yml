@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v1.0.2'
+- 'v1.0.2'
 
 permissions:
   contents: write
@@ -14,10 +14,11 @@ jobs:
     name: Compile OneOS v1.0.2 (Debian 13 Trixie amd64)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+- name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Free Runner Disk Space
+
+- name: Free Runner Disk Space
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
@@ -26,20 +27,23 @@ jobs:
           sudo docker image prune --all --force
           df -h
 
-      - name: Prepare APT Cache Directory
+
+- name: Prepare APT Cache Directory
         run: |
           sudo mkdir -p /var/cache/apt/archives/partial
           sudo chmod -R 777 /var/cache/apt/archives
 
-      - name: Cache APT Archives
+
+- name: Cache APT Archives
         uses: actions/cache@v4
         with:
           path: /var/cache/apt/archives
-          key: oneos-trixie-apt-cache-${{ runner.os }}-v1.0.1
+          key: oneos-trixie-apt-cache-${{ runner.os }}-v1.0.2
           restore-keys: |
             oneos-trixie-apt-cache-${{ runner.os }}-
 
-      - name: Write Privileged Live-Build Script
+
+- name: Write Privileged Live-Build Script
         run: |
           cat <<'BUILD_SCRIPT_EOF' > "${GITHUB_WORKSPACE}/build-oneos.sh"
           #!/usr/bin/env bash
@@ -117,7 +121,7 @@ jobs:
             --bootappend-live "boot=live components quiet splash username=oneos hostname=oneos locales=en_US.UTF-8 keyboard-layouts=us" \
             --iso-application "OneOS" \
             --iso-publisher "OneOS Project" \
-            --iso-volume "OneOS_v1.0.1" \
+            --iso-volume "OneOS_v1.0.2" \
             --apt-recommends false \
             --apt-indices false \
             --cache-packages true
@@ -962,7 +966,7 @@ jobs:
                       FIRST_BOOT_FLAG.write_text("done\n", encoding="utf-8")
 
               def _init_ui(self):
-                  self.setWindowTitle("Welcome to OneOS v1.0.1")
+                  self.setWindowTitle("Welcome to OneOS v1.0.2")
                   self.setFixedSize(580, 440)
                   self.setStyleSheet(
                       "QWidget { background-color: #141722; color: #F2F5FF; }"
@@ -991,7 +995,7 @@ jobs:
                   header_card = QFrame()
                   header_card.setObjectName("HeaderCard")
                   header_layout = QVBoxLayout(header_card)
-                  title = QLabel("OneOS v1.0.1 — Debian 13 (Trixie) KDE Edition")
+                  title = QLabel("OneOS v1.0.2 — Debian 13 (Trixie) KDE Edition")
                   title.setFont(QFont("Sans Serif", 15, QFont.Weight.Bold))
                   subtitle = QLabel(
                       "Powered by KDE Plasma 6, System-Wide Gemini AI, Circle to Search & Multi-Arch Wine."
@@ -1115,7 +1119,7 @@ jobs:
           [Desktop Entry]
           Type=Application
           Name=OneOS Welcome
-          Comment=Welcome to OneOS v1.0.1
+          Comment=Welcome to OneOS v1.0.2
           Exec=/usr/local/bin/oneos-welcome
           Icon=system-help
           Terminal=false
@@ -1240,14 +1244,15 @@ jobs:
             exit 1
           fi
 
-          mv -f "${ISO_FILE}" "/workspace/OneOS-v1.0.1.iso"
-          ls -lh "/workspace/OneOS-v1.0.1.iso"
-          echo "[OneOS] Successfully compiled /workspace/OneOS-v1.0.1.iso"
+          mv -f "${ISO_FILE}" "/workspace/OneOS-v1.0.2.iso"
+          ls -lh "/workspace/OneOS-v1.0.2.iso"
+          echo "[OneOS] Successfully compiled /workspace/OneOS-v1.0.2.iso"
           BUILD_SCRIPT_EOF
 
           chmod +x "${GITHUB_WORKSPACE}/build-oneos.sh"
 
-      - name: Compile OneOS v1.0.1 ISO in Privileged Debian Trixie Container
+
+- name: Compile OneOS v1.0.2 ISO in Privileged Debian Trixie Container
         run: |
           docker run --rm --privileged \
             -v "${GITHUB_WORKSPACE}:/workspace" \
@@ -1256,32 +1261,34 @@ jobs:
             debian:trixie \
             /bin/bash /workspace/build-oneos.sh
 
-      - name: Verify ISO and Split Only If Over GitHub 2GB Limit
+
+- name: Verify ISO and Split Only If Over GitHub 2GB Limit
         run: |
-          test -f "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso"
-          sha256sum "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso" > "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso.sha256"
-          ISO_BYTES=$(stat -c%s "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso")
+          test -f "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso"
+          sha256sum "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso" > "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso.sha256"
+          ISO_BYTES=$(stat -c%s "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso")
           if [ "${ISO_BYTES}" -ge 2097152000 ]; then
             echo "ISO is ${ISO_BYTES} bytes (>= 2GB); splitting into 1900MB parts for GitHub Releases..."
-            split -b 1900M -d "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso" "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso.part"
-            rm -f "${GITHUB_WORKSPACE}/OneOS-v1.0.1.iso"
+            split -b 1900M -d "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso" "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso.part"
+            rm -f "${GITHUB_WORKSPACE}/OneOS-v1.0.2.iso"
           fi
-          ls -lh "${GITHUB_WORKSPACE}"/OneOS-v1.0.1.iso*
+          ls -lh "${GITHUB_WORKSPACE}"/OneOS-v1.0.2.iso*
 
-      - name: Publish OneOS v1.0.1 ISO to GitHub Releases
+
+- name: Publish OneOS v1.0.2 ISO to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.1
-          name: OneOS v1.0.1 (Debian 13 Trixie KDE Plasma 6)
+          tag_name: v1.0.2
+          name: OneOS v1.0.2 (Debian 13 Trixie KDE Plasma 6)
           body: |
-            ## OneOS v1.0.1 Release (Debian 13 Trixie amd64)
-            - **Desktop Environment:** KDE Plasma 6 (`sddm`, `kwin-x11`, `dolphin`, `konsole`, Kvantum, Papirus-Dark) with complete XFCE purge.
-            - **First-Boot Visual Profile Wizard:** Prompts on first login to choose between **✨ Liquid Glass Mode** (KWin acrylic blur, contrast, translucent Kvantum glass engine & translucent app rules) or **⚡ Sleek Obsidian Matte Mode** (ultra-smooth dark theme with 0.25x animations and zero GPU blur overhead).
-            - **Low-End & VM Performance Optimisations:** Pre-configured ZRAM (`zstd`), tuned `sysctl` VM parameters, and disabled Baloo background file indexing.
-            - **AI Features:** System-Wide Gemini Assistant (`Super + Space`) and Desktop Circle to Search (`Super + Shift + S`).
-            - **Pre-installed Stack:** Multi-arch Wine (`amd64` + `i386`), Winetricks, Lutris, Brave Browser, Calamares Installer, and VM Guest Drivers.
+            ## OneOS v1.0.2 Release (Debian 13 Trixie amd64)
+- **Desktop Environment:** KDE Plasma 6 (`sddm`, `kwin-x11`, `dolphin`, `konsole`, Kvantum, Papirus-Dark) with complete XFCE purge.
+- **First-Boot Visual Profile Wizard:** Prompts on first login to choose between **✨ Liquid Glass Mode** (KWin acrylic blur, contrast, translucent Kvantum glass engine & translucent app rules) or **⚡ Sleek Obsidian Matte Mode** (ultra-smooth dark theme with 0.25x animations and zero GPU blur overhead).
+- **Low-End & VM Performance Optimisations:** Pre-configured ZRAM (`zstd`), tuned `sysctl` VM parameters, and disabled Baloo background file indexing.
+- **AI Features:** System-Wide Gemini Assistant (`Super + Space`) and Desktop Circle to Search (`Super + Shift + S`).
+- **Pre-installed Stack:** Multi-arch Wine (`amd64` + `i386`), Winetricks, Lutris, Brave Browser, Calamares Installer, and VM Guest Drivers.
           files: |
-            OneOS-v1.0.1.iso*
+            OneOS-v1.0.2.iso*
           draft: false
           prerelease: false
         env:
