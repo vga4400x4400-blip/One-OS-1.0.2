@@ -426,6 +426,7 @@ jobs:
           VISUAL_SH_EOF
 
           # Verified package list for Debian 13 (Trixie), amd64 only (i386 Wine is installed in the hook)
+          # NOTE: on Trixie the Spectacle screenshot package is called "kde-spectacle", not "spectacle".
           cat <<'PKG_LIST_EOF' > config/package-lists/custom.list.chroot
           live-boot
           live-config
@@ -441,7 +442,9 @@ jobs:
           xserver-xorg
           x11-xserver-utils
           xdg-utils
+          xdg-user-dirs
           xdg-desktop-portal-kde
+          xdg-desktop-portal-gtk
           task-kde-desktop
           kde-standard
           plasma-desktop
@@ -451,10 +454,11 @@ jobs:
           konsole
           dolphin
           kate
+          kdialog
           ark
           gwenview
           okular
-          spectacle
+          kde-spectacle
           plasma-nm
           plasma-pa
           plasma-systemmonitor
@@ -517,9 +521,11 @@ jobs:
           GEMINI_ENV = CONF_DIR / "gemini.env"
           VISUAL_MODE_FILE = CONF_DIR / "visual_mode"
           FIRST_BOOT_FLAG = CONF_DIR / "first_boot_done"
+          NEWELLE_FLAG = CONF_DIR / "newelle_installed"
           STARTUP_FLAG = CONF_DIR / "welcome_startup"
           RELEASE_FILE = Path("/etc/oneos-release")
           APPLY_VISUAL_MODE = "/usr/local/bin/oneos-apply-visual-mode"
+          NEWELLE_SETUP = "/usr/local/bin/oneos-newelle-setup"
 
           API_BASE = "https://generativelanguage.googleapis.com/v1beta"
           DEFAULT_MODEL = "gemini-2.5-flash"
@@ -610,6 +616,10 @@ jobs:
                   return subprocess.run(["systemd-detect-virt", "--quiet"], check=False).returncode == 0
               except OSError:
                   return False
+
+
+          def newelle_installed():
+              return NEWELLE_FLAG.exists()
 
 
           def startup_enabled():
@@ -1425,6 +1435,182 @@ jobs:
           CTS_PY_EOF
 
           # ------------------------------------------------------------------
+          # Newelle: installs the Newelle AI assistant (Flathub) after the first-boot wizard,
+          # applies the permissions/terminal settings that make it useful, then starts it so
+          # Newelle's own first-run setup appears.
+          #   oneos-newelle-setup --install      install (if needed), configure, launch
+          #   oneos-newelle-setup --auto         login-time retry: asks once, skipped in live sessions
+          #   oneos-newelle-setup --launch-mini  open the Newelle quick window (installs first if missing)
+          # ------------------------------------------------------------------
+          cat <<'NEWELLE_SH_EOF' > config/includes.chroot/usr/local/bin/oneos-newelle-setup
+          #!/usr/bin/env bash
+          # OneOS: install and configure Newelle (https://github.com/qwersyk/Newelle) from Flathub.
+          set -uo pipefail
+
+          APP_ID="io.github.qwersyk.Newelle"
+          REMOTE_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
+          CONF_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/oneos"
+          LOG_DIR="${HOME}/.cache/oneos"
+          LOG_FILE="${LOG_DIR}/newelle-setup.log"
+          DONE_FLAG="${CONF_DIR}/newelle_installed"
+          MIN_LIVE_KB=4194304
+          MODE="${1:---install}"
+
+          mkdir -p "${CONF_DIR}" "${LOG_DIR}"
+
+          say()  { printf '\n\033[1;36m[Newelle]\033[0m %s\n' "$*"; }
+          warn() { printf '\n\033[1;33m[Newelle]\033[0m %s\n' "$*"; }
+
+          notify() {
+            if command -v notify-send >/dev/null 2>&1; then
+              notify-send -i "${3:-dialog-information}" "$1" "${2:-}" || true
+            fi
+          }
+
+          is_live() { grep -q 'boot=live' /proc/cmdline 2>/dev/null; }
+          is_installed() { flatpak info "${APP_ID}" >/dev/null 2>&1; }
+          have_network() { curl -fsS --max-time 8 -o /dev/null "${REMOTE_URL}" >/dev/null 2>&1; }
+          pause_close() { printf '\nPress Enter to close this window...'; read -r _ || true; }
+
+          # Show progress in a Konsole window when started from the desktop (no terminal attached)
+          relaunch_in_terminal() {
+            if [ -t 1 ] || [ "${ONEOS_IN_TERM:-0}" = "1" ]; then
+              return 0
+            fi
+            if command -v konsole >/dev/null 2>&1; then
+              ONEOS_IN_TERM=1 exec konsole --separate --hide-menubar -e "$0" "$@"
+            fi
+            return 0
+          }
+
+          launch_newelle() {
+            nohup flatpak run "${APP_ID}" "$@" >/dev/null 2>&1 &
+            disown || true
+          }
+
+          configure_newelle() {
+            say "Applying OneOS settings for Newelle..."
+            # Let Newelle run the commands it suggests on the real system (opt-in per command inside Newelle)
+            flatpak override --user \
+              --talk-name=org.freedesktop.Flatpak \
+              --filesystem=home \
+              "${APP_ID}" || true
+            # Use Konsole for terminal commands, and Plasma-friendly defaults
+            flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal-on true || true
+            flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal "'konsole -e bash -c {0}'" || true
+          }
+
+          install_newelle() {
+            if ! command -v flatpak >/dev/null 2>&1; then
+              warn "Flatpak is not installed on this system."
+              return 1
+            fi
+
+            if is_live; then
+              local avail_kb
+              avail_kb="$(df --output=avail -k "${HOME}" 2>/dev/null | tail -n 1 | tr -d ' ')"
+              if [ "${avail_kb:-0}" -lt "${MIN_LIVE_KB}" ]; then
+                warn "Not enough free space in the live session (Newelle needs about 4 GB)."
+                warn "It will be set up automatically after you install OneOS to disk."
+                notify "Newelle" "Not enough space in the live session. It will be set up after installing OneOS." dialog-information
+                return 2
+              fi
+            fi
+
+            say "Checking your internet connection..."
+            local tries=0
+            until have_network; do
+              tries=$((tries + 1))
+              if [ "${tries}" -ge 12 ]; then
+                warn "No internet connection. Connect to Wi-Fi or Ethernet, then try again from OneOS Welcome."
+                return 1
+              fi
+              sleep 5
+            done
+
+            say "Adding the Flathub app store..."
+            flatpak remote-add --user --if-not-exists flathub "${REMOTE_URL}" || true
+
+            say "Installing Newelle. This can take a few minutes..."
+            local attempt
+            for attempt in 1 2 3; do
+              if flatpak install --user -y --noninteractive flathub "${APP_ID}"; then
+                return 0
+              fi
+              warn "Attempt ${attempt} failed. Retrying in 5 seconds..."
+              sleep 5
+            done
+            return 1
+          }
+
+          case "${MODE}" in
+            --install)
+              ;;
+            --launch-mini)
+              if is_installed; then
+                exec flatpak run "${APP_ID}" --mini
+              fi
+              MODE="--install"
+              ;;
+            --auto)
+              [ -f "${CONF_DIR}/first_boot_done" ] || exit 0
+              is_installed && exit 0
+              is_live && exit 0
+              command -v flatpak >/dev/null 2>&1 || exit 0
+              sleep 25
+              if command -v kdialog >/dev/null 2>&1; then
+                kdialog --title "OneOS" --dontagain "oneosrc:newelle_prompt" \
+                  --yesno "Newelle, the full AI assistant app for OneOS, is not installed yet.\n\nInstall and set it up now? (needs internet)" || exit 0
+              fi
+              MODE="--install"
+              ;;
+            *)
+              echo "Usage: oneos-newelle-setup [--install|--auto|--launch-mini]" >&2
+              exit 2
+              ;;
+          esac
+
+          relaunch_in_terminal "${MODE}"
+          exec > >(tee -a "${LOG_FILE}") 2>&1
+
+          printf '\033[1;36m'
+          echo "=============================================="
+          echo "   OneOS  |  Newelle AI assistant setup"
+          echo "=============================================="
+          printf '\033[0m'
+
+          if is_installed; then
+            say "Newelle is already installed."
+          else
+            install_newelle
+            rc=$?
+            if [ "${rc}" -eq 2 ]; then
+              sleep 6
+              exit 0
+            fi
+            if [ "${rc}" -ne 0 ]; then
+              warn "Newelle could not be installed. Details: ${LOG_FILE}"
+              notify "Newelle setup failed" "Check your connection and try again from OneOS Welcome." dialog-warning
+              pause_close
+              exit 1
+            fi
+            rm -f "${DONE_FLAG}"
+          fi
+
+          if [ ! -f "${DONE_FLAG}" ]; then
+            configure_newelle
+            date -u +%FT%TZ > "${DONE_FLAG}"
+          fi
+
+          notify "Newelle is ready" "Starting it now. Press Ctrl+Alt+N any time for the quick window." dialog-information
+          say "Starting Newelle. Its own first-run setup will guide you from here."
+          say "Tip: press Ctrl+Alt+N any time for the quick window."
+          launch_newelle
+          sleep 4
+          exit 0
+          NEWELLE_SH_EOF
+
+          # ------------------------------------------------------------------
           # OneOS Welcome: first-boot wizard + everyday hub (/usr/local/bin/oneos-welcome)
           # ------------------------------------------------------------------
           cat <<'WELCOME_PY_EOF' > config/includes.chroot/usr/local/bin/oneos-welcome
@@ -1671,7 +1857,7 @@ jobs:
 
                   self.setObjectName("Root")
                   self.setWindowTitle("Welcome to OneOS")
-                  self.setFixedSize(760, 600)
+                  self.setFixedSize(760, 720)
                   self.setStyleSheet(STYLE)
 
                   outer = QVBoxLayout(self)
@@ -1707,7 +1893,7 @@ jobs:
                   if index == 3:
                       self.refresh_tiles()
 
-              def finish_wizard(self):
+              def finish_wizard(self, install_newelle=True):
                   ui.CONF_DIR.mkdir(parents=True, exist_ok=True)
                   ui.FIRST_BOOT_FLAG.write_text("done\n", encoding="utf-8")
                   if not ui.STARTUP_FLAG.exists():
@@ -1716,6 +1902,14 @@ jobs:
                   self.hub_title.setText("You're all set \U0001F389")
                   self.set_status("Press Super+Space any time to ask Gemini.")
                   self.go(3)
+                  if install_newelle:
+                      self.start_newelle_setup()
+
+              def start_newelle_setup(self):
+                  if launch([ui.NEWELLE_SETUP, "--install"]):
+                      self.set_status("Setting up Newelle in a terminal window...")
+                  else:
+                      self.set_status("Could not start the Newelle setup.")
 
               def closeEvent(self, event):
                   try:
@@ -1739,7 +1933,7 @@ jobs:
                   logo.setObjectName("Logo")
                   title = QLabel("Welcome to OneOS")
                   title.setObjectName("H1")
-                  sub = QLabel("Debian 13 \u00b7 KDE Plasma \u00b7 built-in Gemini AI\nVersion " + self.version)
+                  sub = QLabel("Debian 13 \u00b7 KDE Plasma \u00b7 built-in Gemini AI \u00b7 Newelle\nVersion " + self.version)
                   sub.setObjectName("Sub")
                   for widget in (logo, title, sub):
                       widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1765,7 +1959,7 @@ jobs:
 
                   skip = QPushButton("Skip setup, I'll explore on my own")
                   skip.setObjectName("Link")
-                  skip.clicked.connect(self.finish_wizard)
+                  skip.clicked.connect(lambda: self.finish_wizard(False))
                   layout.addWidget(skip, alignment=Qt.AlignmentFlag.AlignHCenter)
                   return page
 
@@ -1879,7 +2073,7 @@ jobs:
                   page = QWidget()
                   layout = QVBoxLayout(page)
                   layout.setSpacing(10)
-                  title = QLabel("Meet your AI assistant")
+                  title = QLabel("Meet your AI assistants")
                   title.setObjectName("H2")
                   sub = QLabel(
                       "OneOS has Gemini built in. Press Super+Space anywhere to ask a question, "
@@ -1906,6 +2100,25 @@ jobs:
                   pl.addWidget(note)
                   pl.addWidget(self.wizard_key)
                   layout.addWidget(panel)
+
+                  newelle = QFrame()
+                  newelle.setObjectName("Panel")
+                  nl = QVBoxLayout(newelle)
+                  nl.setContentsMargins(18, 14, 18, 14)
+                  nl.setSpacing(6)
+                  nhead = QLabel("\U0001F4AC  Newelle  \u00b7  full AI assistant app")
+                  nhead.setObjectName("CardName")
+                  nnote = QLabel(
+                      "When you press Finish, OneOS downloads and sets up Newelle for you (needs internet). "
+                      "It supports chats, documents, voice and terminal commands, and works with Gemini, "
+                      "OpenAI, Ollama and more. Add your key in Newelle's own setup. "
+                      "Quick window: Ctrl+Alt+N."
+                  )
+                  nnote.setObjectName("Muted")
+                  nnote.setWordWrap(True)
+                  nl.addWidget(nhead)
+                  nl.addWidget(nnote)
+                  layout.addWidget(newelle)
                   layout.addStretch()
 
                   nav = QHBoxLayout()
@@ -1914,7 +2127,7 @@ jobs:
                   back.clicked.connect(lambda: self.go(1))
                   skip = QPushButton("Skip for now")
                   skip.setObjectName("Link")
-                  skip.clicked.connect(self.finish_wizard)
+                  skip.clicked.connect(lambda: self.finish_wizard(True))
                   done = QPushButton("Finish  \u2713")
                   done.setObjectName("Primary")
                   done.clicked.connect(self.save_key_and_finish)
@@ -1927,7 +2140,7 @@ jobs:
 
               def save_key_and_finish(self):
                   self.wizard_key.save()
-                  self.finish_wizard()
+                  self.finish_wizard(True)
 
               # ------------------------------------------------------------ page 3: hub
               def page_hub(self):
@@ -1937,7 +2150,7 @@ jobs:
 
                   self.hub_title = QLabel("OneOS Welcome")
                   self.hub_title.setObjectName("H2")
-                  sub = QLabel("Version " + self.version + "  \u00b7  Super+Space: Assistant   \u00b7   Super+Shift+C: Circle to Search")
+                  sub = QLabel("Version " + self.version + "  \u00b7  Super+Space: Assistant   \u00b7   Super+Shift+C: Circle to Search   \u00b7   Ctrl+Alt+N: Newelle")
                   sub.setObjectName("Sub")
                   layout.addWidget(self.hub_title)
                   layout.addWidget(sub)
@@ -1949,6 +2162,8 @@ jobs:
                   self.tile_assistant.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-gemini-assistant.py"]))
                   self.tile_circle = Tile("\u25ce", "Circle to Search", "Draw around anything  \u00b7  Super+Shift+C")
                   self.tile_circle.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-circle-search"]))
+                  self.tile_newelle = Tile("\U0001F4AC", "Newelle AI", "")
+                  self.tile_newelle.clicked.connect(self.open_newelle)
                   self.tile_key = Tile("\U0001F511", "Gemini API key", "")
                   self.tile_key.clicked.connect(self.edit_key)
                   if self.live:
@@ -1963,15 +2178,18 @@ jobs:
                   self.tile_info.clicked.connect(lambda: self.open_tool(["konsole", "--hold", "-e", "fastfetch"]))
                   self.tile_settings = Tile("\u2699\ufe0f", "System Settings", "Wi-Fi, display, sound and more")
                   self.tile_settings.clicked.connect(lambda: self.open_tool(["systemsettings"]))
+                  self.tile_update = Tile("\U0001F504", "Update OneOS", "Install system and Flatpak updates")
+                  self.tile_update.clicked.connect(self.run_updates)
 
                   grid = QGridLayout()
                   grid.setHorizontalSpacing(12)
                   grid.setVerticalSpacing(12)
                   tiles = [
                       self.tile_appearance, self.tile_assistant,
-                      self.tile_circle, self.tile_key,
-                      self.tile_install, self.tile_wine,
-                      self.tile_info, self.tile_settings,
+                      self.tile_circle, self.tile_newelle,
+                      self.tile_key, self.tile_install,
+                      self.tile_wine, self.tile_info,
+                      self.tile_settings, self.tile_update,
                   ]
                   for index, tile in enumerate(tiles):
                       grid.addWidget(tile, index // 2, index % 2)
@@ -2004,6 +2222,10 @@ jobs:
                       self.tile_key.set_texts("Gemini API key  \u2713", "Saved. Click to replace or test it")
                   else:
                       self.tile_key.set_texts("Gemini API key", "Not set. Click to add your free key")
+                  if ui.newelle_installed():
+                      self.tile_newelle.set_texts("Newelle AI  \u2713", "Open Newelle  \u00b7  quick window: Ctrl+Alt+N")
+                  else:
+                      self.tile_newelle.set_texts("Install Newelle AI", "Download and set up the full AI assistant")
 
               def toggle_mode(self):
                   new_mode = "obsidian" if ui.current_visual_mode() == "glass" else "glass"
@@ -2015,6 +2237,23 @@ jobs:
                   dialog = ApiKeyDialog(self)
                   dialog.exec()
                   self.refresh_tiles()
+
+              def open_newelle(self):
+                  if launch([ui.NEWELLE_SETUP, "--install"]):
+                      if ui.newelle_installed():
+                          self.set_status("Opening Newelle...")
+                      else:
+                          self.set_status("Setting up Newelle in a terminal window...")
+                  else:
+                      self.set_status("Could not start the Newelle setup.")
+
+              def run_updates(self):
+                  script = (
+                      "echo 'Updating OneOS...'; sudo apt-get update && sudo apt-get -y full-upgrade; "
+                      "if command -v flatpak >/dev/null 2>&1; then flatpak update -y; fi; "
+                      "echo; echo 'All done. You can close this window.'"
+                  )
+                  self.open_tool(["konsole", "--hold", "-e", "bash", "-c", script])
 
               def open_tool(self, cmd):
                   if launch(cmd):
@@ -2065,6 +2304,7 @@ jobs:
             config/includes.chroot/usr/local/bin/oneos-apply-visual-mode \
             config/includes.chroot/usr/local/bin/oneos-gemini-assistant.py \
             config/includes.chroot/usr/local/bin/oneos-circle-search \
+            config/includes.chroot/usr/local/bin/oneos-newelle-setup \
             config/includes.chroot/usr/local/bin/oneos-welcome \
             config/includes.chroot/usr/local/lib/oneos/live-autologin.sh
 
@@ -2080,6 +2320,20 @@ jobs:
           OnlyShowIn=KDE;
           X-KDE-autostart-after=panel
           AUTOSTART_EOF
+
+          # Login-time retry: if Newelle is not installed yet (no network earlier, closed wizard,
+          # or installed from the live ISO) it asks once and offers to set it up.
+          cat <<'NEWELLE_AUTOSTART_EOF' > config/includes.chroot/etc/xdg/autostart/oneos-newelle-setup.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=OneOS Newelle Setup
+          Comment=Offers to install the Newelle AI assistant after first-boot setup
+          Exec=/usr/local/bin/oneos-newelle-setup --auto
+          Icon=system-software-install
+          Terminal=false
+          OnlyShowIn=KDE;
+          X-KDE-autostart-after=panel
+          NEWELLE_AUTOSTART_EOF
 
           cat <<'WELCOME_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-welcome.desktop
           [Desktop Entry]
@@ -2116,6 +2370,19 @@ jobs:
           Categories=Utility;
           CTS_DESKTOP_EOF
 
+          # Newelle quick window: works before and after install (installs first if missing)
+          cat <<'NEWELLE_MINI_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-newelle-mini.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Newelle Quick Window
+          Comment=Open the Newelle AI assistant quick window (Ctrl+Alt+N)
+          Exec=/usr/local/bin/oneos-newelle-setup --launch-mini
+          Icon=io.github.qwersyk.Newelle
+          Terminal=false
+          StartupNotify=false
+          Categories=Utility;
+          NEWELLE_MINI_DESKTOP_EOF
+
           # Global shortcuts. Circle to Search uses Super+Shift+C because Spectacle owns Super+Shift+S.
           cat <<'SHORTCUTS_EOF' > config/includes.chroot/etc/xdg/kglobalshortcutsrc
           [services][oneos-gemini-assistant.desktop]
@@ -2123,6 +2390,9 @@ jobs:
 
           [services][oneos-circle-search.desktop]
           _launch=Meta+Shift+C,Meta+Shift+C,OneOS Circle to Search
+
+          [services][oneos-newelle-mini.desktop]
+          _launch=Ctrl+Alt+N,Ctrl+Alt+N,Newelle Quick Window
           SHORTCUTS_EOF
 
           # ------------------------------------------------------------------
@@ -2159,7 +2429,8 @@ jobs:
           fi
           command -v kwriteconfig6 >/dev/null 2>&1 || echo "[OneOS] WARNING: kwriteconfig6 is missing; visual profiles will not apply"
 
-          # Flathub for the Software Center
+          # Flathub (system-wide) for the Software Center. Newelle itself is installed per-user
+          # after the first-boot wizard, so it is not baked into the ISO (keeps the ISO small).
           flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
 
           # Brave Browser
@@ -2285,7 +2556,8 @@ jobs:
 
             ### What's new in the experience
             - **First-boot wizard:** a guided setup for your look, your Gemini key and your shortcuts, with a one-click **Install to disk** option in the live session.
-            - **OneOS Welcome hub:** one window for appearance, AI, software, Wine and system tools. Optional at login.
+            - **Newelle AI, installed for you:** when the wizard finishes, OneOS downloads **Newelle** from Flathub, applies sensible permissions (host command access, home folder) and Konsole as its terminal, then starts it so Newelle's own first-run setup guides you. Open the quick window any time with `Ctrl + Alt + N`. If you were offline or skipped, OneOS offers to set it up again at your next login.
+            - **OneOS Welcome hub:** one window for appearance, AI, software, updates, Wine and system tools. Optional at login.
             - **OneOS Assistant (`Super + Space`):** a Spotlight-style Gemini chat with conversation history, Markdown answers, copy buttons, clipboard quick actions and friendly error messages.
             - **Circle to Search (`Super + Shift + C`):** draw freely around anything on screen, then ask Gemini about it.
             - **Two visual profiles:** ✨ Liquid Glass (KWin blur, translucent apps, aurora wallpaper) and ⚡ Sleek Obsidian (matte, zero GPU overhead), switchable live without logging out.
@@ -2295,6 +2567,10 @@ jobs:
             - KDE Plasma (`sddm`, `kwin-x11`, `dolphin`, `konsole`, Kvantum) with XFCE fully removed
             - Multi-arch Wine (`amd64` + `i386`), Winetricks, Lutris, Brave Browser, Calamares installer, VM guest drivers
             - ZRAM (`zstd`), tuned `sysctl`, Baloo indexing disabled for low-end hardware
+
+            ### Notes
+            - Newelle needs an internet connection and about 4 GB of free space. In a small live session it is set up after you install OneOS to disk.
+            - Newelle is granted access to your home folder and can run commands outside its sandbox. Review what it suggests before approving commands.
 
             ### Verify your download
             ```
