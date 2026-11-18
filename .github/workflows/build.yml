@@ -24,7 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - name: Checkout Repository
+      - name: Checkout 
+Repository
         uses: actions/checkout@v4
 
       - name: Resolve Version
@@ -37,7 +38,8 @@ jobs:
             VERSION="${INPUT_VERSION:-1.0.4}"
           fi
           VERSION="${VERSION#v}"
-          echo "ONEOS_VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "ONEOS_VERSION=${VERSION}" >> 
+"${GITHUB_ENV}"
           echo "Building OneOS ${VERSION}"
 
       - name: Free Runner Disk Space
@@ -50,7 +52,8 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Prepare APT Cache Directory
+      - name: Prepare APT Cache 
+Directory
         run: |
           sudo mkdir -p /var/cache/apt/archives/partial
           sudo chmod -R 777 /var/cache/apt/archives
@@ -73,7 +76,8 @@ jobs:
           export LC_ALL=C.UTF-8
           export LANG=C.UTF-8
 
-          ONEOS_VERSION="${ONEOS_VERSION:?ONEOS_VERSION is required}"
+          ONEOS_VERSION="${ONEOS_VERSION:?ONEOS_VERSION is 
+required}"
           WORKDIR="/workspace/oneos-build"
           CHROOT_DIR="${WORKDIR}/chroot"
 
@@ -83,7 +87,8 @@ jobs:
 
           cleanup() {
             echo "[OneOS] Executing trap cleanup for chroot mountpoints..."
-            { grep "${CHROOT_DIR}" /proc/mounts 2>/dev/null || true; } | awk '{print $2}' | sort -r | while read -r mp; do
+            { grep "${CHROOT_DIR}" /proc/mounts 2>/dev/null || true; 
+} | awk '{print $2}' | sort -r | while read -r mp; do
               if [ -n "${mp}" ]; then
                 umount -lf "${mp}" 2>/dev/null || true
               fi
@@ -95,7 +100,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             live-build \
-            debootstrap \
+            debootstrap 
+\
             squashfs-tools \
             xorriso \
             isolinux \
@@ -108,7 +114,8 @@ jobs:
             mtools \
             dosfstools \
             ca-certificates \
-            curl \
+            curl 
+\
             wget \
             gnupg \
             cpio \
@@ -120,7 +127,8 @@ jobs:
           cd "${WORKDIR}"
 
           echo "[OneOS] Configuring live-build for Debian 13 (trixie) amd64..."
-          lb config noauto \
+          lb config noauto 
+\
             --distribution trixie \
             --architectures amd64 \
             --archive-areas "main contrib non-free non-free-firmware" \
@@ -131,7 +139,8 @@ jobs:
             --bootappend-live "boot=live components quiet username=oneos hostname=oneos locales=en_US.UTF-8 keyboard-layouts=us" \
             --iso-application "OneOS" \
             --iso-publisher "OneOS Project" \
-            --iso-volume "OneOS_v${ONEOS_VERSION}" \
+            --iso-volume "OneOS_v${ONEOS_VERSION}" 
+\
             --apt-recommends false \
             --apt-indices false \
             --cache-packages true
@@ -143,7 +152,8 @@ jobs:
             config/apt \
             config/archives \
             config/hooks/normal \
-            config/includes.chroot/etc/apt/preferences.d \
+            config/includes.chroot/etc/apt/preferences.d 
+\
             config/includes.chroot/etc/default \
             config/includes.chroot/etc/X11 \
             config/includes.chroot/etc/initramfs-tools/conf.d \
@@ -166,7 +176,8 @@ jobs:
           Pin-Priority: -1
           APT_PREF_EOF
 
-          cp config/apt/preferences config/includes.chroot/etc/apt/preferences.d/99-no-xfce
+          cp config/apt/preferences 
+config/includes.chroot/etc/apt/preferences.d/99-no-xfce
 
           # Enforce KDE tasksel default and SDDM display manager
           cat <<'TASKSEL_EOF' > config/includes.chroot/etc/default/tasksel
@@ -177,7 +188,8 @@ jobs:
           /usr/sbin/sddm
           DM_EOF
 
-          # Prevent initramfs boot hangs
+          # Prevent initramfs boot 
+hangs
           cat <<'RESUME_EOF' > config/includes.chroot/etc/initramfs-tools/conf.d/resume
           RESUME=none
           RESUME_EOF
@@ -199,7 +211,8 @@ jobs:
 
           # Disable KDE Baloo background file indexing by default
           cat <<'BALOO_EOF' > config/includes.chroot/etc/xdg/baloofilerc
-          [Basic Settings]
+          [Basic 
+Settings]
           Indexing-Enabled=false
           BALOO_EOF
 
@@ -210,7 +223,8 @@ jobs:
           PLASMAWELCOME_EOF
 
           # Default KDE globals: Breeze Dark, Papirus icons, Inter font, OneOS blue accent
-          cat <<'KDEGLOBALS_EOF' > config/includes.chroot/etc/xdg/kdeglobals
+          cat <<'KDEGLOBALS_EOF' > 
+config/includes.chroot/etc/xdg/kdeglobals
           [General]
           ColorScheme=BreezeDark
           Name=Breeze Dark
@@ -223,7 +237,8 @@ jobs:
           smallestReadableFont=Inter,8,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
 
           [Icons]
-          Theme=Papirus-Dark
+          
+Theme=Papirus-Dark
 
           [KDE]
           AnimationDurationFactor=0.5
@@ -233,7 +248,8 @@ jobs:
 
           # SDDM config. The [Theme] section is (re)written by the chroot hook once it knows which
           # greeter theme really got installed. No autologin here: it is enabled only in the live session.
-          cat <<'SDDM_EOF' > config/includes.chroot/etc/sddm.conf.d/10-oneos-kde.conf
+          cat <<'SDDM_EOF' > 
+config/includes.chroot/etc/sddm.conf.d/10-oneos-kde.conf
           [General]
           DisplayServer=x11
 
@@ -243,6 +259,8 @@ jobs:
 
           # Live-session-only autologin, so installed systems keep a normal login screen.
           # The session file is detected at boot, so it works whichever Plasma session exists.
+          # It also sets the live user's password (oneos / 1234) once live-config has created the 
+account.
           cat <<'LIVE_AUTOLOGIN_EOF' > config/includes.chroot/usr/local/lib/oneos/live-autologin.sh
           #!/bin/sh
           SESSION=""
@@ -254,10 +272,21 @@ jobs:
               SESSION="$(basename "${candidate}")"
               break
             fi
-          done
+          
+done
           [ -n "${SESSION}" ] || SESSION="plasmax11.desktop"
 
-          mkdir -p /etc/sddm.conf.d
+          # Wait (up to 30 s) for live-config to create the oneos user, then set its password
+          i=0
+          while ! id oneos >/dev/null 2>&1 && [ "${i}" -lt 30 ]; do
+            sleep 1
+            i=$((i + 1))
+          done
+          echo "oneos:1234" | chpasswd
+          passwd -u oneos >/dev/null 2>&1 || true
+
+          mkdir -p 
+/etc/sddm.conf.d
           cat > /etc/sddm.conf.d/20-oneos-live-autologin.conf <<INNER_EOF
           [Autologin]
           User=oneos
@@ -267,7 +296,8 @@ jobs:
           LIVE_AUTOLOGIN_EOF
 
           cat <<'LIVE_UNIT_EOF' > config/includes.chroot/etc/systemd/system/oneos-live-autologin.service
-          [Unit]
+          
+[Unit]
           Description=OneOS live session autologin
           ConditionKernelCommandLine=boot=live
           After=live-config.service
@@ -280,7 +310,8 @@ jobs:
 
           [Install]
           WantedBy=graphical.target
-          LIVE_UNIT_EOF
+          
+LIVE_UNIT_EOF
 
           # Enable the autologin unit directly (does not depend on systemctl working inside the chroot)
           ln -sf /etc/systemd/system/oneos-live-autologin.service \
@@ -288,7 +319,8 @@ jobs:
 
           # Kvantum translucent config for Liquid Glass mode
           cat <<'KV_GLASS_EOF' > config/includes.chroot/usr/share/Kvantum/OneOSGlass/OneOSGlass.kvconfig
-          [%General]
+          
+[%General]
           author=OneOS Project
           comment=Liquid Glass Translucent Engine for OneOS
           x11drag=all
@@ -301,7 +333,8 @@ jobs:
           toolbar_interior_spacing=2
           spread_progressbar=true
           composite=true
-          menu_shadow_depth=7
+          
+menu_shadow_depth=7
           tooltip_shadow_depth=6
           splitter_width=7
           scroll_width=10
@@ -314,7 +347,8 @@ jobs:
           check_size=16
           textless_progressbar=false
           progressbar_thickness=6
-          menubar_mouse_tracking=true
+          
+menubar_mouse_tracking=true
           slim_toolbars=true
           merge_menubar_with_toolbar=true
           small_icon_size=16
@@ -327,7 +361,8 @@ jobs:
           combo_menu=true
           hide_combo_checkboxes=true
           lineedit_underline=false
-          spin_button_width=16
+          
+spin_button_width=16
           fill_rubberband=true
           translucent_windows=true
           blurring=true
@@ -337,7 +372,8 @@ jobs:
           no_window_pattern=false
           opaque=kaffeine,kmplayer,subtitlecomposer,kdenlive,vlc,smplayer,smplayer2,avidemux,avidemux2_qt4,avidemux3_qt4,avidemux3_qt5,qarte,knights,virtualbox,trojita,dragon,digikam
 
-          [GeneralColors]
+          
+[GeneralColors]
           window.color=#C8121521
           base.color=#B40E111A
           alt.base.color=#B4161A28
@@ -350,7 +386,8 @@ jobs:
           highlight.color=#5882FF
           inactive.highlight.color=#3954A6
           text.color=#F2F5FF
-          window.text.color=#F2F5FF
+          
+window.text.color=#F2F5FF
           button.text.color=#FFFFFF
           disabled.text.color=#6E7A99
           tooltip.text.color=#F2F5FF
@@ -362,7 +399,8 @@ jobs:
 
           # ------------------------------------------------------------------
           # Visual profile switcher: /usr/local/bin/oneos-apply-visual-mode
-          # ------------------------------------------------------------------
+          # 
+------------------------------------------------------------------
           cat <<'VISUAL_SH_EOF' > config/includes.chroot/usr/local/bin/oneos-apply-visual-mode
           #!/usr/bin/env bash
           set -euo pipefail
@@ -374,7 +412,8 @@ jobs:
           KWRITE=""
           for candidate in kwriteconfig6 kwriteconfig5; do
             if command -v "${candidate}" >/dev/null 2>&1; then
-              KWRITE="${candidate}"
+              
+KWRITE="${candidate}"
               break
             fi
           done
@@ -399,7 +438,8 @@ jobs:
             kw kwinrc Compositing Backend "OpenGL"
             kw kwinrc Compositing LatencyPolicy "Medium"
             kw kwinrc Plugins blurEnabled "true"
-            kw kwinrc Plugins contrastEnabled "true"
+            kw kwinrc Plugins contrastEnabled 
+"true"
             kw kwinrc Effect-blur BlurStrength "11"
             kw kwinrc Effect-blur NoiseStrength "2"
 
@@ -409,7 +449,8 @@ jobs:
             kw kwinrulesrc 1 Description "OneOS Liquid Glass Translucent Apps"
             kw kwinrulesrc 1 wmclass "dolphin|konsole|systemsettings"
             kw kwinrulesrc 1 wmclasscomplete "false"
-            kw kwinrulesrc 1 wmclassmatch "3"
+            kw kwinrulesrc 1 wmclassmatch 
+"3"
             kw kwinrulesrc 1 opacityactive "92"
             kw kwinrulesrc 1 opacityactiverule "2"
             kw kwinrulesrc 1 opacityinactive "86"
@@ -422,7 +463,8 @@ jobs:
             kw kdeglobals Icons Theme "Papirus-Dark"
             kw kdeglobals KDE AnimationDurationFactor "0.25"
 
-            # No GPU shaders: maximum responsiveness
+            # No GPU shaders: maximum 
+responsiveness
             kw kwinrc Compositing LatencyPolicy "Low"
             kw kwinrc Plugins blurEnabled "false"
             kw kwinrc Plugins contrastEnabled "false"
@@ -434,7 +476,8 @@ jobs:
 
           # Matching wallpaper
           WALL="/usr/share/backgrounds/oneos/oneos-${MODE}.png"
-          if [ -f "${WALL}" ] && command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then
+          if [ -f "${WALL}" ] && command -v plasma-apply-wallpaperimage >/dev/null 2>&1; 
+then
             plasma-apply-wallpaperimage "${WALL}" >/dev/null 2>&1 || true
           fi
 
@@ -443,14 +486,16 @@ jobs:
           fi
 
           # Tell running apps the style changed, then reconfigure KWin live (no logout needed)
-          dbus-send --session --type=signal /KGlobalSettings org.kde.KGlobalSettings.notifyChange int32:2 int32:0 >/dev/null 2>&1 || true
+          dbus-send --session --type=signal /KGlobalSettings 
+org.kde.KGlobalSettings.notifyChange int32:2 int32:0 >/dev/null 2>&1 || true
           dbus-send --session --dest=org.kde.KWin --type=method_call /KWin org.kde.KWin.reconfigure >/dev/null 2>&1 || true
           VISUAL_SH_EOF
 
           # Verified package list for Debian 13 (Trixie), amd64 only (i386 Wine is installed in the hook).
           # NOTE: on Trixie the Spectacle screenshot package is called "kde-spectacle", not "spectacle".
           # Packages whose exact Trixie name is uncertain (SDDM theme, QML6 modules) are installed
-          # one by one in the chroot hook, so a wrong name cannot abort the whole build.
+          # one by one in the chroot hook, so a wrong name cannot abort the whole 
+build.
           cat <<'PKG_LIST_EOF' > config/package-lists/custom.list.chroot
           live-boot
           live-config
@@ -463,7 +508,8 @@ jobs:
           gnupg
           dbus-x11
           xorg
-          xserver-xorg
+          
+xserver-xorg
           x11-xserver-utils
           xdg-utils
           xdg-user-dirs
@@ -476,7 +522,8 @@ jobs:
           kwin-x11
           sddm
           breeze
-          systemsettings
+          
+systemsettings
           konsole
           dolphin
           kate
@@ -489,7 +536,8 @@ jobs:
           plasma-pa
           plasma-systemmonitor
           plasma-discover
-          powerdevil
+          
+powerdevil
           kscreen
           bluedevil
           pipewire-audio
@@ -502,7 +550,8 @@ jobs:
           kde-config-gtk-style
           breeze-gtk-theme
           papirus-icon-theme
-          fonts-inter
+          
+fonts-inter
           fonts-noto-core
           fonts-noto-color-emoji
           zram-tools
@@ -515,7 +564,8 @@ jobs:
           fastfetch
           htop
           flatpak
-          libnotify-bin
+          
+libnotify-bin
           firmware-misc-nonfree
           intel-microcode
           amd64-microcode
@@ -528,7 +578,8 @@ jobs:
           python3-pyqt6
           python3-requests
           python3-pil
-          PKG_LIST_EOF
+          
+PKG_LIST_EOF
 
           # ------------------------------------------------------------------
           # Shared helper module (config, Gemini client, background worker)
@@ -538,7 +589,8 @@ jobs:
           """Shared helpers for the OneOS desktop tools (Welcome, Assistant, Circle to Search)."""
           import os
           import subprocess
-          from pathlib import Path
+          from pathlib import 
+Path
 
           import requests
           from PyQt6.QtCore import QThread, pyqtSignal
@@ -550,7 +602,8 @@ jobs:
           NEWELLE_FLAG = CONF_DIR / "newelle_installed"
           STARTUP_FLAG = CONF_DIR / "welcome_startup"
           RELEASE_FILE = Path("/etc/oneos-release")
-          APPLY_VISUAL_MODE = "/usr/local/bin/oneos-apply-visual-mode"
+          APPLY_VISUAL_MODE = 
+"/usr/local/bin/oneos-apply-visual-mode"
           NEWELLE_SETUP = "/usr/local/bin/oneos-newelle-setup"
 
           API_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -560,7 +613,8 @@ jobs:
               "You are OneOS Assistant, built into a Debian KDE Plasma desktop. "
               "Be concise and practical. Use Markdown. When you suggest shell commands, "
               "put them in fenced code blocks."
-          )
+          
+)
 
 
           class GeminiError(Exception):
@@ -572,7 +626,8 @@ jobs:
               try:
                   for line in RELEASE_FILE.read_text(encoding="utf-8").splitlines():
                       if line.startswith("ONEOS_VERSION="):
-                          return line.split("=", 1)[1].strip().strip('"')
+                          return line.split("=", 
+1)[1].strip().strip('"')
               except OSError:
                   pass
               return "dev"
@@ -584,7 +639,8 @@ jobs:
                   for line in GEMINI_ENV.read_text(encoding="utf-8").splitlines():
                       line = line.strip()
                       if not line or line.startswith("#") or "=" not in line:
-                          continue
+                          
+continue
                       key, value = line.split("=", 1)
                       data[key.strip()] = value.strip().strip('"').strip("'")
               except OSError:
@@ -596,7 +652,8 @@ jobs:
               CONF_DIR.mkdir(parents=True, exist_ok=True)
               body = "".join('%s="%s"\n' % (k, v) for k, v in data.items())
               fd = os.open(str(GEMINI_ENV), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-              with os.fdopen(fd, "w", encoding="utf-8") as handle:
+              with os.fdopen(fd, "w", encoding="utf-8") as 
+handle:
                   handle.write(body)
               GEMINI_ENV.chmod(0o600)
 
@@ -608,7 +665,8 @@ jobs:
           def save_api_key(key):
               clean = key.strip().replace('"', "").replace("'", "")
               data = read_env_file()
-              data["GEMINI_API_KEY"] = clean
+              data["GEMINI_API_KEY"] = 
+clean
               write_env_file(data)
 
 
@@ -619,7 +677,8 @@ jobs:
           def current_visual_mode():
               try:
                   return VISUAL_MODE_FILE.read_text(encoding="utf-8").strip() or "obsidian"
-              except OSError:
+              except 
+OSError:
                   return "obsidian"
 
 
@@ -631,7 +690,8 @@ jobs:
 
 
           def is_live_session():
-              try:
+              
+try:
                   return "boot=live" in Path("/proc/cmdline").read_text(encoding="utf-8")
               except OSError:
                   return False
@@ -665,7 +725,8 @@ jobs:
               return {"x-goog-api-key": api_key, "Content-Type": "application/json"}
 
 
-          def _network_message(exc):
+          def 
+_network_message(exc):
               if isinstance(exc, requests.exceptions.ConnectionError):
                   return "No internet connection. Connect to Wi-Fi or Ethernet and try again."
               if isinstance(exc, requests.exceptions.Timeout):
@@ -676,7 +737,8 @@ jobs:
           def _explain_http_error(resp):
               code = resp.status_code
               try:
-                  message = resp.json().get("error", {}).get("message", "")
+                  message = resp.json().get("error", {}).get("message", 
+"")
               except ValueError:
                   message = ""
               if code == 400 and "api key" in message.lower():
@@ -686,7 +748,8 @@ jobs:
               if code == 404:
                   return "That Gemini model was not found. Set GEMINI_MODEL in ~/.config/oneos/gemini.env."
               if code == 429:
-                  return "Gemini rate limit or free quota reached. Wait a minute and try again."
+                  return "Gemini rate limit or free quota reached. Wait a 
+minute and try again."
               if code >= 500:
                   return "The Gemini service is busy right now. Please try again shortly."
               return "Gemini error " + str(code) + ((": " + message) if message else ".")
@@ -696,7 +759,8 @@ jobs:
               url = API_BASE + "/models/" + (model or load_model()) + ":generateContent"
               payload = {
                   "contents": contents,
-                  "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                  "systemInstruction": {"parts": [{"text": 
+SYSTEM_PROMPT}]},
               }
               try:
                   resp = requests.post(url, headers=_headers(api_key), json=payload, timeout=60)
@@ -707,7 +771,8 @@ jobs:
               data = resp.json()
               candidates = data.get("candidates") or []
               if not candidates:
-                  reason = (data.get("promptFeedback") or {}).get("blockReason")
+                  reason = (data.get("promptFeedback") or 
+{}).get("blockReason")
                   raise GeminiError("Gemini returned no answer" + ((" (" + reason + ")") if reason else "") + ".")
               parts = (candidates[0].get("content") or {}).get("parts") or []
               text = "\n".join(p.get("text", "") for p in parts if "text" in p).strip()
@@ -717,7 +782,8 @@ jobs:
           def test_api_key(api_key):
               try:
                   resp = requests.get(API_BASE + "/models?pageSize=1", headers=_headers(api_key), timeout=20)
-              except requests.exceptions.RequestException as exc:
+              except requests.exceptions.RequestException as 
+exc:
                   raise GeminiError(_network_message(exc))
               if resp.status_code != 200:
                   raise GeminiError(_explain_http_error(resp))
@@ -752,7 +818,8 @@ jobs:
           import argparse
           import atexit
           import base64
-          import os
+          import 
+os
           import signal
           import subprocess
           import sys
@@ -763,7 +830,8 @@ jobs:
 
           from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QTimer  # noqa: E402
           from PyQt6.QtGui import QColor, QGuiApplication, QImage, QKeySequence, QPixmap, QShortcut  # noqa: E402
-          from PyQt6.QtWidgets import (  # noqa: E402
+          from PyQt6.QtWidgets import (  # noqa: 
+E402
               QApplication,
               QFrame,
               QGraphicsDropShadowEffect,
@@ -776,7 +844,8 @@ jobs:
               QWidget,
           )
 
-          PID_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "oneos-gemini-assistant.pid"
+          PID_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or 
+"/tmp") / "oneos-gemini-assistant.pid"
           CIRCLE_SEARCH = "/usr/local/bin/oneos-circle-search"
           WELCOME = "/usr/local/bin/oneos-welcome"
           MAX_BUBBLE_WIDTH = 500
@@ -786,21 +855,24 @@ jobs:
           QLabel { color: #EEF2FF; background: transparent; }
           QLabel#Title { font-size: 14px; font-weight: 700; }
           QLabel#ModelChip { color: #9AA6C8; background-color: rgba(255,255,255,18); border-radius: 9px; padding: 2px 9px; font-size: 11px; }
-          QLabel#Muted { color: #8C98BA; font-size: 11px; }
+          QLabel#Muted { color: #8C98BA; font-size: 11px; 
+}
           QLabel#Spark { font-size: 34px; color: #7FA0FF; }
           QLabel#Hero { font-size: 22px; font-weight: 700; }
           QFrame#UserBubble { background-color: #4B6FE8; border-radius: 14px; }
           QFrame#UserBubble QLabel { color: #FFFFFF; }
           QFrame#AiBubble { background-color: rgba(255,255,255,16); border: 1px solid rgba(255,255,255,22); border-radius: 14px; }
           QFrame#ImageRow { background-color: rgba(255,255,255,12); border-radius: 12px; }
-          QLineEdit { background-color: rgba(255,255,255,20); color: #FFFFFF; border: 1px solid rgba(255,255,255,40); border-radius: 12px; padding: 10px 14px; font-size: 13px; selection-background-color: #5882FF; }
+          QLineEdit { background-color: rgba(255,255,255,20); color: #FFFFFF; border: 1px solid rgba(255,255,255,40); border-radius: 12px; padding: 10px 14px; font-size: 13px; selection-background-color: #5882FF; 
+}
           QLineEdit:focus { border: 1px solid #7FA0FF; }
           QPushButton { background-color: rgba(255,255,255,18); color: #EEF2FF; border: none; border-radius: 9px; padding: 6px 12px; font-weight: 600; }
           QPushButton:hover { background-color: rgba(255,255,255,36); }
           QPushButton#Primary { background-color: #5882FF; color: #FFFFFF; padding: 9px 18px; border-radius: 12px; }
           QPushButton#Primary:hover { background-color: #6F95FF; }
           QPushButton#Primary:disabled { background-color: rgba(88,130,255,90); color: rgba(255,255,255,120); }
-          QPushButton#Chip { background-color: transparent; border: 1px solid rgba(255,255,255,45); border-radius: 15px; padding: 7px 14px; }
+          QPushButton#Chip { background-color: transparent; border: 1px solid rgba(255,255,255,45); border-radius: 15px; padding: 7px 
+14px; }
           QPushButton#Chip:hover { background-color: rgba(255,255,255,24); }
           QPushButton#Ghost { background-color: transparent; color: #9AA6C8; padding: 2px 8px; font-weight: 500; font-size: 11px; }
           QPushButton#Ghost:hover { color: #FFFFFF; }
@@ -808,7 +880,8 @@ jobs:
           QScrollArea > QWidget > QWidget { background: transparent; }
           QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
           QScrollBar::handle:vertical { background: rgba(255,255,255,50); border-radius: 4px; min-height: 28px; }
-          QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+          QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { 
+height: 0px; }
           QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
           """
 
@@ -830,7 +903,8 @@ jobs:
           def single_instance(replace):
               """A second launch closes the open overlay (toggle). With replace=True it takes over instead."""
               try:
-                  old_pid = int(PID_FILE.read_text().strip())
+                  old_pid = 
+int(PID_FILE.read_text().strip())
                   os.kill(old_pid, 0)
                   cmdline = Path("/proc/%d/cmdline" % old_pid).read_bytes()
                   if b"oneos-gemini-assistant" in cmdline and old_pid != os.getpid():
@@ -841,7 +915,8 @@ jobs:
                   pass
               try:
                   PID_FILE.write_text(str(os.getpid()))
-                  atexit.register(_remove_pid)
+                  
+atexit.register(_remove_pid)
               except OSError:
                   pass
               return False
@@ -853,7 +928,8 @@ jobs:
                   return None
               if max(image.width(), image.height()) > 1600:
                   image = image.scaled(
-                      1600, 1600, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                      1600, 1600, Qt.AspectRatioMode.KeepAspectRatio, 
+Qt.TransformationMode.SmoothTransformation
                   )
               data = QByteArray()
               buffer = QBuffer(data)
@@ -865,7 +941,8 @@ jobs:
 
           def run_shell(cmd):
               try:
-                  done = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                  done = subprocess.run(cmd, shell=True, capture_output=True, text=True, 
+timeout=30)
                   output = ((done.stdout or "") + (done.stderr or "")).strip()
                   if not output:
                       output = "[finished with exit code %d]" % done.returncode
@@ -876,7 +953,8 @@ jobs:
               return "```\n$ " + cmd + "\n\n" + output.replace("```", "'''") + "\n```"
 
 
-          class DragHeader(QFrame):
+          class 
+DragHeader(QFrame):
               def mousePressEvent(self, event):
                   if event.button() == Qt.MouseButton.LeftButton:
                       handle = self.window().windowHandle()
@@ -889,7 +967,8 @@ jobs:
               def __init__(self, text, role, copyable=True):
                   super().__init__()
                   self.raw = text
-                  self.setObjectName("UserBubble" if role == "user" else "AiBubble")
+                  self.setObjectName("UserBubble" if role == "user" else 
+"AiBubble")
                   self.setMaximumWidth(MAX_BUBBLE_WIDTH)
                   layout = QVBoxLayout(self)
                   layout.setContentsMargins(13, 9, 13, 9)
@@ -901,7 +980,8 @@ jobs:
                   )
                   self.label.setText(text)
                   self.label.setOpenExternalLinks(True)
-                  self.label.setTextInteractionFlags(
+                  
+self.label.setTextInteractionFlags(
                       Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
                   )
                   layout.addWidget(self.label)
@@ -911,7 +991,8 @@ jobs:
                       self.copy_btn.setObjectName("Ghost")
                       self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                       self.copy_btn.clicked.connect(self._copy)
-                      layout.addWidget(self.copy_btn, alignment=Qt.AlignmentFlag.AlignRight)
+                      layout.addWidget(self.copy_btn, 
+alignment=Qt.AlignmentFlag.AlignRight)
 
               def set_text(self, text):
                   self.raw = text
@@ -923,7 +1004,8 @@ jobs:
                   QTimer.singleShot(1300, lambda: self.copy_btn.setText("Copy"))
 
 
-          class AssistantOverlay(QWidget):
+          class 
+AssistantOverlay(QWidget):
               def __init__(self, image_path=None):
                   super().__init__()
                   self.glass = ui.current_visual_mode() == "glass"
@@ -935,7 +1017,8 @@ jobs:
                   self.worker = None
                   self.thinking_row = None
                   self.thinking_bubble = None
-                  self.dots = 0
+                  self.dots = 
+0
                   self.last_text = ""
                   self.dot_timer = QTimer(self)
                   self.dot_timer.timeout.connect(self._tick)
@@ -947,7 +1030,8 @@ jobs:
                   self.setWindowFlags(
                       Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
                   )
-                  self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                  
+self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
                   self.setStyleSheet(stylesheet(self.glass))
                   self.setFixedSize(692, 620)
 
@@ -958,7 +1042,8 @@ jobs:
                   outer.setContentsMargins(16, 16, 16, 16)
 
                   self.card = QFrame()
-                  self.card.setObjectName("Card")
+                  
+self.card.setObjectName("Card")
                   shadow = QGraphicsDropShadowEffect(self)
                   shadow.setBlurRadius(34)
                   shadow.setOffset(0, 10)
@@ -971,7 +1056,8 @@ jobs:
                   root.setSpacing(10)
 
                   # Header
-                  header = DragHeader()
+                  header = 
+DragHeader()
                   hl = QHBoxLayout(header)
                   hl.setContentsMargins(0, 0, 0, 0)
                   hl.setSpacing(8)
@@ -983,7 +1069,8 @@ jobs:
                   hl.addWidget(chip)
                   hl.addStretch()
                   circle_btn = QPushButton("\u25ce  Circle to Search")
-                  circle_btn.setToolTip("Draw around anything on screen (Super+Shift+C)")
+                  circle_btn.setToolTip("Draw around anything on screen 
+(Super+Shift+C)")
                   circle_btn.clicked.connect(self.launch_circle_to_search)
                   new_btn = QPushButton("\uff0b  New chat")
                   new_btn.setToolTip("Ctrl+L")
@@ -1008,7 +1095,8 @@ jobs:
                   remove_btn = QPushButton("Remove")
                   remove_btn.setObjectName("Ghost")
                   remove_btn.clicked.connect(self.clear_image)
-                  il.addWidget(self.thumb)
+                  
+il.addWidget(self.thumb)
                   il.addWidget(note, 1)
                   il.addWidget(remove_btn)
                   root.addWidget(self.image_row)
@@ -1021,7 +1109,8 @@ jobs:
                   spark = QLabel("\u2726")
                   spark.setObjectName("Spark")
                   hero = QLabel("What can I help with?")
-                  hero.setObjectName("Hero")
+                  
+hero.setObjectName("Hero")
                   hint = QLabel("Ask a question, or try  /cmd uname -a  to run a shell command.")
                   hint.setObjectName("Muted")
                   self.chip_row = QHBoxLayout()
@@ -1043,7 +1132,8 @@ jobs:
                   self.msg_layout.setSpacing(10)
                   self.msg_layout.addStretch()
                   self.scroll.setWidget(container)
-                  bar = self.scroll.verticalScrollBar()
+                  bar = 
+self.scroll.verticalScrollBar()
                   bar.rangeChanged.connect(lambda _lo, hi: bar.setValue(hi))
                   root.addWidget(self.scroll, 1)
                   self.scroll.hide()
@@ -1053,7 +1143,8 @@ jobs:
                   row.setSpacing(8)
                   self.prompt_input = QLineEdit()
                   self.prompt_input.setPlaceholderText("Ask Gemini anything...")
-                  self.prompt_input.returnPressed.connect(lambda: self.send())
+                  self.prompt_input.returnPressed.connect(lambda: 
+self.send())
                   self.send_btn = QPushButton("Ask  \u21b5")
                   self.send_btn.setObjectName("Primary")
                   self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1064,7 +1155,8 @@ jobs:
 
                   footer = QLabel("Enter to send   \u00b7   Esc to close   \u00b7   Ctrl+L new chat   \u00b7   Super+Space toggles")
                   footer.setObjectName("Muted")
-                  footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                  
+footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
                   root.addWidget(footer)
 
                   QShortcut(QKeySequence("Escape"), self).activated.connect(self.close)
@@ -1075,7 +1167,8 @@ jobs:
                   self.prompt_input.setFocus()
 
               # ------------------------------------------------------------ image + chips
-              def refresh_image_row(self):
+              def 
+refresh_image_row(self):
                   if self.image_b64 and self.image_path:
                       pixmap = QPixmap(self.image_path)
                       if not pixmap.isNull():
@@ -1087,7 +1180,8 @@ jobs:
                       self.image_row.hide()
 
               def clear_image(self):
-                  self.image_b64 = None
+                  self.image_b64 = 
+None
                   self.image_path = None
                   self.image_sent = False
                   self.refresh_image_row()
@@ -1100,7 +1194,8 @@ jobs:
                           item.widget().deleteLater()
                   if self.image_b64:
                       chips = [
-                          ("Explain this", "Explain what is shown in this image."),
+                          ("Explain this", "Explain what is shown in this 
+image."),
                           ("Extract text", "Extract all text from this image as plain text."),
                           ("Translate", "Translate any text in this image to English."),
                       ]
@@ -1108,7 +1203,8 @@ jobs:
                       chips = [
                           ("Summarize clipboard", "clipboard:Summarize the following text in a few bullet points:"),
                           ("Fix my writing", "clipboard:Fix grammar and spelling, keep the tone:"),
-                          ("Explain clipboard", "clipboard:Explain the following clearly and simply:"),
+                          ("Explain clipboard", "clipboard:Explain the following clearly and 
+simply:"),
                       ]
                   for label, prompt in chips:
                       btn = QPushButton(label)
@@ -1120,7 +1216,8 @@ jobs:
               def run_chip(self, prompt):
                   if prompt.startswith("clipboard:"):
                       clip = QGuiApplication.clipboard().text().strip()
-                      if not clip:
+                      if not 
+clip:
                           self.show_messages()
                           self.add_bubble("Your clipboard is empty. Copy some text first, then try again.", "ai", copyable=False)
                           return
@@ -1144,7 +1241,8 @@ jobs:
                   else:
                       rl.addWidget(bubble)
                       rl.addStretch()
-                  self.msg_layout.insertWidget(self.msg_layout.count() - 1, row)
+                  self.msg_layout.insertWidget(self.msg_layout.count() - 1, 
+row)
                   return bubble, row
 
               def new_chat(self):
@@ -1157,7 +1255,8 @@ jobs:
                       if item.widget():
                           item.widget().deleteLater()
                   self.scroll.hide()
-                  self.empty.show()
+                  
+self.empty.show()
                   self.prompt_input.setFocus()
 
               def set_busy(self, busy):
@@ -1169,7 +1268,8 @@ jobs:
                       self.dots = 0
                       self.dot_timer.start(380)
                   else:
-                      self.dot_timer.stop()
+                      
+self.dot_timer.stop()
                       if self.thinking_row is not None:
                           self.thinking_row.deleteLater()
                           self.thinking_row = None
@@ -1181,7 +1281,8 @@ jobs:
                   if self.thinking_bubble is not None:
                       self.thinking_bubble.set_text("_Thinking" + "." * self.dots + "_")
 
-              # ------------------------------------------------------------ sending
+              # ------------------------------------------------------------ 
+sending
               def send(self, text=None):
                   if self.busy:
                       return
@@ -1192,7 +1293,8 @@ jobs:
                   self.last_text = text
                   self.show_messages()
 
-                  if text.startswith("/cmd"):
+                  if 
+text.startswith("/cmd"):
                       cmd = text[4:].strip()
                       self.add_bubble(text, "user")
                       if not cmd:
@@ -1214,7 +1316,8 @@ jobs:
                           copyable=False,
                       )
                       btn = QPushButton("Open OneOS Welcome")
-                      btn.setObjectName("Primary")
+                      
+btn.setObjectName("Primary")
                       btn.clicked.connect(lambda: subprocess.Popen([WELCOME], start_new_session=True))
                       self.msg_layout.insertWidget(self.msg_layout.count() - 1, btn, alignment=Qt.AlignmentFlag.AlignLeft)
                       return
@@ -1223,7 +1326,8 @@ jobs:
                   if self.image_b64 and not self.image_sent:
                       parts.append({"inline_data": {"mime_type": "image/jpeg", "data": self.image_b64}})
                       self.image_sent = True
-                  parts.append({"text": text or "Explain what is shown in this image."})
+                  parts.append({"text": text or "Explain what is shown in this 
+image."})
                   self.history.append({"role": "user", "parts": parts})
 
                   self.set_busy(True)
@@ -1234,7 +1338,8 @@ jobs:
               def on_done(self, result, local):
                   self.set_busy(False)
                   if isinstance(result, Exception):
-                      if not local and self.history and self.history[-1]["role"] == "user":
+                      if not local and self.history and self.history[-1]["role"] 
+== "user":
                           self.history.pop()
                           if not self.history:
                               self.image_sent = False
@@ -1245,7 +1350,8 @@ jobs:
                       return
                   if not local:
                       self.history.append({"role": "model", "parts": [{"text": result}]})
-                  self.add_bubble(result, "ai")
+                  self.add_bubble(result, 
+"ai")
 
               # ------------------------------------------------------------ actions
               def launch_circle_to_search(self):
@@ -1256,7 +1362,8 @@ jobs:
 
           def main():
               parser = argparse.ArgumentParser(description="OneOS Assistant")
-              parser.add_argument("--image", type=str, default=None, help="Image to attach (screen region)")
+              parser.add_argument("--image", type=str, default=None, 
+help="Image to attach (screen region)")
               args = parser.parse_args()
 
               if single_instance(replace=bool(args.image)):
@@ -1282,7 +1389,8 @@ jobs:
           GEMINI_PY_EOF
 
           # ------------------------------------------------------------------
-          # Circle to Search: freehand "draw around it" screen selection
+          # Circle to Search: freehand "draw around it" screen 
+selection
           # ------------------------------------------------------------------
           cat <<'CTS_PY_EOF' > config/includes.chroot/usr/local/bin/oneos-circle-search
           #!/usr/bin/env python3
@@ -1303,7 +1411,8 @@ jobs:
 
 
           def runtime_dir():
-              return os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+              return os.environ.get("XDG_RUNTIME_DIR") or 
+tempfile.gettempdir()
 
 
           def notify(message):
@@ -1314,7 +1423,8 @@ jobs:
 
           def capture_screen(app):
               if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" and shutil.which("spectacle"):
-                  tmp = os.path.join(runtime_dir(), "oneos-cts-full.png")
+                  tmp = os.path.join(runtime_dir(), 
+"oneos-cts-full.png")
                   subprocess.run(["spectacle", "-b", "-n", "-m", "-o", tmp], check=False, timeout=20)
                   pixmap = QPixmap(tmp)
                   try:
@@ -1326,7 +1436,8 @@ jobs:
               return app.primaryScreen().grabWindow(0)
 
 
-          class SelectionOverlay(QWidget):
+          class 
+SelectionOverlay(QWidget):
               def __init__(self, shot, geometry):
                   super().__init__()
                   self.shot = shot
@@ -1338,7 +1449,8 @@ jobs:
                   self.setCursor(Qt.CursorShape.CrossCursor)
                   self.setGeometry(geometry)
 
-              # ------------------------------------------------------------ input
+              # ------------------------------------------------------------ 
+input
               def keyPressEvent(self, event):
                   if event.key() == Qt.Key.Key_Escape:
                       QApplication.quit()
@@ -1351,7 +1463,8 @@ jobs:
                       self.points = [event.position()]
                       self.update()
                   elif event.button() == Qt.MouseButton.RightButton:
-                      QApplication.quit()
+                      
+QApplication.quit()
 
               def mouseMoveEvent(self, event):
                   if self.drawing:
@@ -1363,7 +1476,8 @@ jobs:
 
               def mouseReleaseEvent(self, event):
                   if event.button() != Qt.MouseButton.LeftButton or not self.drawing:
-                      return
+                      
+return
                   self.drawing = False
                   rect = self.selection_rect()
                   if rect is None or rect.width() < 24 or rect.height() < 24:
@@ -1376,7 +1490,8 @@ jobs:
               def path(self):
                   path = QPainterPath()
                   if self.points:
-                      path.moveTo(self.points[0])
+                      
+path.moveTo(self.points[0])
                       for point in self.points[1:]:
                           path.lineTo(point)
                   return path
@@ -1389,7 +1504,8 @@ jobs:
 
               def finish(self, rect):
                   ratio_x = self.shot.width() / max(1, self.width())
-                  ratio_y = self.shot.height() / max(1, self.height())
+                  ratio_y = self.shot.height() / max(1, 
+self.height())
                   crop = QRect(
                       int(rect.x() * ratio_x),
                       int(rect.y() * ratio_y),
@@ -1401,7 +1517,8 @@ jobs:
                       notify("Could not save the selected region.")
                       QApplication.quit()
                       return
-                  self.hide()
+                  
+self.hide()
                   subprocess.Popen([ASSISTANT, "--image", out], start_new_session=True)
                   QApplication.quit()
 
@@ -1413,7 +1530,8 @@ jobs:
                   painter.fillRect(self.rect(), QColor(8, 10, 22, 150))
 
                   rect = self.selection_rect()
-                  if rect is not None:
+                  if rect is not 
+None:
                       painter.save()
                       painter.setClipRect(rect)
                       painter.drawPixmap(self.rect(), self.shot)
@@ -1424,7 +1542,8 @@ jobs:
                           pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                           pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
                           painter.setPen(pen)
-                          painter.setBrush(Qt.BrushStyle.NoBrush)
+                          
+painter.setBrush(Qt.BrushStyle.NoBrush)
                           painter.drawPath(path)
 
                   # Hint pill
@@ -1437,7 +1556,8 @@ jobs:
                   pill = QRectF((self.width() - width) / 2, 26, width, 38)
                   painter.setPen(Qt.PenStyle.NoPen)
                   painter.setBrush(QColor(16, 19, 32, 225))
-                  painter.drawRoundedRect(pill, 19, 19)
+                  painter.drawRoundedRect(pill, 19, 
+19)
                   painter.setPen(QColor(238, 242, 255))
                   painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, HINT)
 
@@ -1448,7 +1568,8 @@ jobs:
               shot = capture_screen(app)
               if shot.isNull():
                   notify("Could not capture the screen. On Wayland, install or allow Spectacle.")
-                  return 1
+                  return 
+1
               overlay = SelectionOverlay(shot, app.primaryScreen().geometry())
               overlay.showFullScreen()
               overlay.activateWindow()
@@ -1460,7 +1581,8 @@ jobs:
               sys.exit(main())
           CTS_PY_EOF
 
-          # ------------------------------------------------------------------
+          # 
+------------------------------------------------------------------
           # Newelle: installs the Newelle AI assistant (Flathub) after the first-boot wizard,
           # applies the permissions/terminal settings that make it useful, then starts it so
           # Newelle's own first-run setup appears.
@@ -1468,7 +1590,8 @@ jobs:
           #   oneos-newelle-setup --auto         login-time retry: asks once, skipped in live sessions
           #   oneos-newelle-setup --launch-mini  open the Newelle quick window (installs first if missing)
           # ------------------------------------------------------------------
-          cat <<'NEWELLE_SH_EOF' > config/includes.chroot/usr/local/bin/oneos-newelle-setup
+          cat <<'NEWELLE_SH_EOF' > 
+config/includes.chroot/usr/local/bin/oneos-newelle-setup
           #!/usr/bin/env bash
           # OneOS: install and configure Newelle (https://github.com/qwersyk/Newelle) from Flathub.
           set -uo pipefail
@@ -1479,7 +1602,8 @@ jobs:
           LOG_DIR="${HOME}/.cache/oneos"
           LOG_FILE="${LOG_DIR}/newelle-setup.log"
           DONE_FLAG="${CONF_DIR}/newelle_installed"
-          MIN_LIVE_KB=4194304
+          
+MIN_LIVE_KB=4194304
           MODE="${1:---install}"
 
           mkdir -p "${CONF_DIR}" "${LOG_DIR}"
@@ -1502,7 +1626,8 @@ jobs:
           relaunch_in_terminal() {
             if [ -t 1 ] || [ "${ONEOS_IN_TERM:-0}" = "1" ]; then
               return 0
-            fi
+            
+fi
             if command -v konsole >/dev/null 2>&1; then
               ONEOS_IN_TERM=1 exec konsole --separate --hide-menubar -e "$0" "$@"
             fi
@@ -1514,7 +1639,8 @@ jobs:
             disown || true
           }
 
-          configure_newelle() {
+          configure_newelle() 
+{
             say "Applying OneOS settings for Newelle..."
             # Let Newelle run the commands it suggests on the real system (opt-in per command inside Newelle)
             flatpak override --user \
@@ -1523,7 +1649,8 @@ jobs:
               "${APP_ID}" || true
             # Use Konsole for terminal commands, and Plasma-friendly defaults
             flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal-on true || true
-            flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal "'konsole -e bash -c {0}'" || true
+            flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal "'konsole -e bash -c 
+{0}'" || true
           }
 
           install_newelle() {
@@ -1535,7 +1662,8 @@ jobs:
             if is_live; then
               local avail_kb
               avail_kb="$(df --output=avail -k "${HOME}" 2>/dev/null | tail -n 1 | tr -d ' ')"
-              if [ "${avail_kb:-0}" -lt "${MIN_LIVE_KB}" ]; then
+              if [ "${avail_kb:-0}" -lt "${MIN_LIVE_KB}" ]; 
+then
                 warn "Not enough free space in the live session (Newelle needs about 4 GB)."
                 warn "It will be set up automatically after you install OneOS to disk."
                 notify "Newelle" "Not enough space in the live session. It will be set up after installing OneOS." dialog-information
@@ -1545,7 +1673,8 @@ jobs:
 
             say "Checking your internet connection..."
             local tries=0
-            until have_network; do
+            until have_network; 
+do
               tries=$((tries + 1))
               if [ "${tries}" -ge 12 ]; then
                 warn "No internet connection. Connect to Wi-Fi or Ethernet, then try again from OneOS Welcome."
@@ -1581,7 +1710,8 @@ jobs:
             --auto)
               [ -f "${CONF_DIR}/first_boot_done" ] || exit 0
               is_installed && exit 0
-              is_live && exit 0
+              is_live && exit 
+0
               command -v flatpak >/dev/null 2>&1 || exit 0
               sleep 25
               if command -v kdialog >/dev/null 2>&1; then
@@ -1591,7 +1721,8 @@ jobs:
               MODE="--install"
               ;;
             *)
-              echo "Usage: oneos-newelle-setup [--install|--auto|--launch-mini]" >&2
+              echo "Usage: oneos-newelle-setup 
+[--install|--auto|--launch-mini]" >&2
               exit 2
               ;;
           esac
@@ -1616,7 +1747,8 @@ jobs:
             fi
             if [ "${rc}" -ne 0 ]; then
               warn "Newelle could not be installed. Details: ${LOG_FILE}"
-              notify "Newelle setup failed" "Check your connection and try again from OneOS Welcome." dialog-warning
+              notify "Newelle setup failed" "Check your connection and try again from OneOS Welcome." 
+dialog-warning
               pause_close
               exit 1
             fi
@@ -1628,7 +1760,8 @@ jobs:
             date -u +%FT%TZ > "${DONE_FLAG}"
           fi
 
-          notify "Newelle is ready" "Starting it now. Press Ctrl+Alt+N any time for the quick window." dialog-information
+          notify "Newelle is ready" "Starting it now. Press Ctrl+Alt+N any time for the quick window." 
+dialog-information
           say "Starting Newelle. Its own first-run setup will guide you from here."
           say "Tip: press Ctrl+Alt+N any time for the quick window."
           launch_newelle
@@ -1639,7 +1772,8 @@ jobs:
           # ------------------------------------------------------------------
           # OneOS Welcome: first-boot wizard + everyday hub (/usr/local/bin/oneos-welcome)
           # ------------------------------------------------------------------
-          cat <<'WELCOME_PY_EOF' > config/includes.chroot/usr/local/bin/oneos-welcome
+          cat <<'WELCOME_PY_EOF' > 
+config/includes.chroot/usr/local/bin/oneos-welcome
           #!/usr/bin/env python3
           """OneOS Welcome - first-boot setup wizard and the everyday hub."""
           import shutil
@@ -1651,7 +1785,8 @@ jobs:
 
           from PyQt6.QtCore import Qt, QUrl  # noqa: E402
           from PyQt6.QtGui import QDesktopServices  # noqa: E402
-          from PyQt6.QtWidgets import (  # noqa: E402
+          from PyQt6.QtWidgets import (  # noqa: 
+E402
               QApplication,
               QButtonGroup,
               QCheckBox,
@@ -1664,7 +1799,8 @@ jobs:
               QMessageBox,
               QPushButton,
               QStackedWidget,
-              QVBoxLayout,
+              
+QVBoxLayout,
               QWidget,
           )
 
@@ -1676,7 +1812,8 @@ jobs:
           QLabel#H2 { font-size: 22px; font-weight: 700; }
           QLabel#Sub { color: #9AA6C8; font-size: 13px; }
           QLabel#Muted { color: #8C98BA; font-size: 12px; }
-          QLabel#Badge { background-color: #1F8F5F; color: #FFFFFF; border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: 700; }
+          QLabel#Badge { background-color: #1F8F5F; color: #FFFFFF; border-radius: 8px; padding: 2px 8px; font-size: 10px; 
+font-weight: 700; }
           QLabel#CardName { font-size: 15px; font-weight: 700; }
           QLabel#TileTitle { font-size: 14px; font-weight: 700; }
           QLabel#TileIcon { font-size: 22px; }
@@ -1684,7 +1821,8 @@ jobs:
           QPushButton { color: #FFFFFF; font-size: 13px; font-weight: 600; }
           QPushButton#Primary { background-color: #5882FF; border: none; border-radius: 11px; padding: 11px 24px; font-weight: 700; }
           QPushButton#Primary:hover { background-color: #6F95FF; }
-          QPushButton#Secondary { background-color: #222942; border: 1px solid #33405F; border-radius: 11px; padding: 11px 24px; }
+          QPushButton#Secondary { background-color: #222942; border: 1px solid #33405F; border-radius: 11px; padding: 11px 24px; 
+}
           QPushButton#Secondary:hover { background-color: #2C3555; }
           QPushButton#Link { background: transparent; border: none; color: #7FA0FF; padding: 6px 10px; }
           QPushButton#Link:hover { color: #A9C0FF; }
@@ -1692,7 +1830,8 @@ jobs:
           QPushButton#Choice:hover { border-color: #4A5C9C; }
           QPushButton#Choice:checked { background-color: #1B2342; border: 2px solid #5882FF; }
           QPushButton#Tile { background-color: #171B2C; border: 1px solid #2B3454; border-radius: 14px; text-align: left; }
-          QPushButton#Tile:hover { background-color: #1E2646; border-color: #4A62B8; }
+          QPushButton#Tile:hover { background-color: #1E2646; 
+border-color: #4A62B8; }
           QLineEdit { background-color: #1D2336; color: #FFFFFF; border: 1px solid #3B4A72; border-radius: 10px; padding: 10px 12px; font-size: 13px; }
           QLineEdit:focus { border-color: #5882FF; }
           QCheckBox { color: #B8C4E6; font-size: 12px; spacing: 8px; }
@@ -1702,7 +1841,8 @@ jobs:
           def launch(cmd):
               try:
                   subprocess.Popen(
-                      cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                      cmd, start_new_session=True, stdout=subprocess.DEVNULL, 
+stderr=subprocess.DEVNULL
                   )
                   return True
               except OSError:
@@ -1714,7 +1854,8 @@ jobs:
 
 
           class ApiKeyPanel(QWidget):
-              def __init__(self):
+              def 
+__init__(self):
                   super().__init__()
                   self._worker = None
                   layout = QVBoxLayout(self)
@@ -1726,7 +1867,8 @@ jobs:
                   self.field.setEchoMode(QLineEdit.EchoMode.Password)
                   has_key = bool(ui.load_api_key())
                   self.field.setPlaceholderText(
-                      "A key is saved - paste a new one to replace it" if has_key else "Paste your key here (AIza...)"
+                      "A key is saved - paste a new one to replace it" if has_key else "Paste your key here 
+(AIza...)"
                   )
                   self.show_btn = QPushButton("Show")
                   self.show_btn.setObjectName("Secondary")
@@ -1739,7 +1881,8 @@ jobs:
                   actions = QHBoxLayout()
                   self.test_btn = QPushButton("Test key")
                   self.test_btn.setObjectName("Secondary")
-                  self.test_btn.clicked.connect(self.test)
+                  
+self.test_btn.clicked.connect(self.test)
                   get_btn = QPushButton("Get a free key  \u2197")
                   get_btn.setObjectName("Link")
                   get_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(ui.KEY_URL)))
@@ -1751,7 +1894,8 @@ jobs:
                   self.status = QLabel("")
                   self.status.setWordWrap(True)
                   self.status.setObjectName("Muted")
-                  layout.addWidget(self.status)
+                  
+layout.addWidget(self.status)
 
               def _toggle_show(self, on):
                   self.field.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
@@ -1762,7 +1906,8 @@ jobs:
                   self.status.setText(text)
 
               def save(self):
-                  key = self.field.text().strip()
+                  key = 
+self.field.text().strip()
                   if key:
                       ui.save_api_key(key)
                       self.field.clear()
@@ -1774,7 +1919,8 @@ jobs:
                   if not key:
                       self._say("Paste a key first.", "#F87171")
                       return
-                  self._say("Checking with Google...")
+                  self._say("Checking with 
+Google...")
                   self.test_btn.setEnabled(False)
                   self._worker = ui.FuncWorker(ui.test_api_key, key)
                   self._worker.done.connect(self._tested)
@@ -1799,7 +1945,8 @@ jobs:
                   layout.setSpacing(12)
                   title = QLabel("Gemini API key")
                   title.setObjectName("H2")
-                  sub = QLabel("Stored only on this computer in ~/.config/oneos/gemini.env")
+                  sub = QLabel("Stored only on this computer in 
+~/.config/oneos/gemini.env")
                   sub.setObjectName("Sub")
                   layout.addWidget(title)
                   layout.addWidget(sub)
@@ -1812,7 +1959,8 @@ jobs:
                   cancel.setObjectName("Secondary")
                   cancel.clicked.connect(self.reject)
                   save = QPushButton("Save")
-                  save.setObjectName("Primary")
+                  
+save.setObjectName("Primary")
                   save.clicked.connect(self._save)
                   row.addWidget(cancel)
                   row.addWidget(save)
@@ -1825,7 +1973,8 @@ jobs:
 
           class Tile(QPushButton):
               def __init__(self, icon, title, desc):
-                  super().__init__()
+                  
+super().__init__()
                   self.setObjectName("Tile")
                   self.setCursor(Qt.CursorShape.PointingHandCursor)
                   self.setMinimumHeight(76)
@@ -1838,7 +1987,8 @@ jobs:
                   column = QVBoxLayout()
                   column.setSpacing(2)
                   self.title_lbl = QLabel(title)
-                  self.title_lbl.setObjectName("TileTitle")
+                  
+self.title_lbl.setObjectName("TileTitle")
                   self.desc_lbl = QLabel(desc)
                   self.desc_lbl.setObjectName("Muted")
                   self.desc_lbl.setWordWrap(True)
@@ -1849,7 +1999,8 @@ jobs:
                   for child in (self.icon_lbl, self.title_lbl, self.desc_lbl):
                       child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-              def set_texts(self, title=None, desc=None):
+              def set_texts(self, title=None, 
+desc=None):
                   if title is not None:
                       self.title_lbl.setText(title)
                   if desc is not None:
@@ -1860,7 +2011,8 @@ jobs:
               "glass": {
                   "name": "\u2728  Liquid Glass",
                   "desc": "Frosted blur, translucent windows and a soft aurora wallpaper. Best on a real GPU.",
-                  "bg": "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2F3F8F, stop:0.55 #6A52C9, stop:1 #2AA3D4)",
+                  "bg": "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2F3F8F, stop:0.55 #6A52C9, stop:1 
+#2AA3D4)",
                   "inner": "background-color: rgba(255,255,255,60); border: 1px solid rgba(255,255,255,90);",
               },
               "obsidian": {
@@ -1869,7 +2021,8 @@ jobs:
                   "bg": "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0E1018, stop:1 #222A47)",
                   "inner": "background-color: #1B2036; border: 1px solid #2F3A5E;",
               },
-          }
+          
+}
 
 
           class Welcome(QWidget):
@@ -1893,7 +2046,8 @@ jobs:
                   self.dots = []
                   dot_row = QHBoxLayout()
                   dot_row.addStretch()
-                  for _ in range(3):
+                  for _ in 
+range(3):
                       dot = QLabel("\u25cf")
                       self.dots.append(dot)
                       dot_row.addWidget(dot)
@@ -1919,7 +2073,8 @@ jobs:
                   if index == 3:
                       self.refresh_tiles()
 
-              def finish_wizard(self, install_newelle=True):
+              def finish_wizard(self, 
+install_newelle=True):
                   ui.CONF_DIR.mkdir(parents=True, exist_ok=True)
                   ui.FIRST_BOOT_FLAG.write_text("done\n", encoding="utf-8")
                   if not ui.STARTUP_FLAG.exists():
@@ -1941,7 +2096,8 @@ jobs:
                   try:
                       if not ui.FIRST_BOOT_FLAG.exists():
                           ui.CONF_DIR.mkdir(parents=True, exist_ok=True)
-                          ui.FIRST_BOOT_FLAG.write_text("done\n", encoding="utf-8")
+                          ui.FIRST_BOOT_FLAG.write_text("done\n", 
+encoding="utf-8")
                   except OSError:
                       pass
                   super().closeEvent(event)
@@ -1954,7 +2110,8 @@ jobs:
                   page = QWidget()
                   layout = QVBoxLayout(page)
                   layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                  layout.setSpacing(12)
+                  
+layout.setSpacing(12)
                   logo = QLabel("\u2726")
                   logo.setObjectName("Logo")
                   title = QLabel("Welcome to OneOS")
@@ -1966,7 +2123,8 @@ jobs:
                       layout.addWidget(widget)
                   layout.addSpacing(18)
 
-                  start = QPushButton("Set up OneOS  \u2192")
+                  start = QPushButton("Set up OneOS  
+\u2192")
                   start.setObjectName("Primary")
                   start.setFixedWidth(340)
                   start.clicked.connect(lambda: self.go(1))
@@ -1977,7 +2135,8 @@ jobs:
                       install.setObjectName("Secondary")
                       install.setFixedWidth(340)
                       install.clicked.connect(self.install)
-                      layout.addWidget(install, alignment=Qt.AlignmentFlag.AlignHCenter)
+                      layout.addWidget(install, 
+alignment=Qt.AlignmentFlag.AlignHCenter)
                       note = QLabel("You are running OneOS live. Nothing is changed on your disk until you install.")
                       note.setObjectName("Muted")
                       note.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1999,7 +2158,8 @@ jobs:
                   sub = QLabel("Pick a visual style. You can switch any time from OneOS Welcome.")
                   sub.setObjectName("Sub")
                   layout.addWidget(title)
-                  layout.addWidget(sub)
+                  
+layout.addWidget(sub)
                   layout.addSpacing(8)
 
                   self.group = QButtonGroup(self)
@@ -2012,7 +2172,8 @@ jobs:
                       self.choices[mode] = button
                       self.group.addButton(button)
                       cards.addWidget(button)
-                  self.group.buttonClicked.connect(lambda b: setattr(self, "mode", b.property("mode")))
+                  self.group.buttonClicked.connect(lambda b: setattr(self, 
+"mode", b.property("mode")))
                   self.choices[self.mode].setChecked(True)
                   layout.addLayout(cards, 1)
 
@@ -2024,7 +2185,8 @@ jobs:
                   hint.setObjectName("Muted")
                   layout.addWidget(hint)
 
-                  nav = QHBoxLayout()
+                  nav = 
+QHBoxLayout()
                   back = QPushButton("Back")
                   back.setObjectName("Secondary")
                   back.clicked.connect(lambda: self.go(0))
@@ -2037,7 +2199,8 @@ jobs:
                   layout.addLayout(nav)
                   return page
 
-              def make_choice(self, mode):
+              def make_choice(self, 
+mode):
                   info = MODES[mode]
                   button = QPushButton()
                   button.setObjectName("Choice")
@@ -2050,7 +2213,8 @@ jobs:
                   layout.setSpacing(8)
 
                   swatch = QFrame()
-                  swatch.setFixedHeight(130)
+                  
+swatch.setFixedHeight(130)
                   swatch.setStyleSheet("QFrame#Swatch { background: " + info["bg"] + "; border-radius: 10px; }")
                   swatch.setObjectName("Swatch")
                   sl = QVBoxLayout(swatch)
@@ -2061,7 +2225,8 @@ jobs:
                   sl.addWidget(window)
                   layout.addWidget(swatch)
 
-                  name_row = QHBoxLayout()
+                  name_row = 
+QHBoxLayout()
                   name = QLabel(info["name"])
                   name.setObjectName("CardName")
                   name_row.addWidget(name)
@@ -2074,7 +2239,8 @@ jobs:
 
                   desc = QLabel(info["desc"])
                   desc.setObjectName("Sub")
-                  desc.setWordWrap(True)
+                  
+desc.setWordWrap(True)
                   desc.setAlignment(Qt.AlignmentFlag.AlignTop)
                   layout.addWidget(desc, 1)
 
@@ -2084,7 +2250,8 @@ jobs:
 
               def run_apply(self, mode):
                   QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                  QApplication.processEvents()
+                  
+QApplication.processEvents()
                   try:
                       ui.apply_visual_mode(mode)
                   finally:
@@ -2096,7 +2263,8 @@ jobs:
 
               # ------------------------------------------------------------ page 2: Gemini key
               def page_ai(self):
-                  page = QWidget()
+                  page = 
+QWidget()
                   layout = QVBoxLayout(page)
                   layout.setSpacing(10)
                   title = QLabel("Meet your AI assistants")
@@ -2107,7 +2275,8 @@ jobs:
                   )
                   sub.setObjectName("Sub")
                   sub.setWordWrap(True)
-                  layout.addWidget(title)
+                  
+layout.addWidget(title)
                   layout.addWidget(sub)
                   layout.addSpacing(6)
 
@@ -2119,7 +2288,8 @@ jobs:
                   head = QLabel("Gemini API key")
                   head.setObjectName("CardName")
                   note = QLabel("Free from Google AI Studio. It stays on this computer in ~/.config/oneos/gemini.env.")
-                  note.setObjectName("Muted")
+                  
+note.setObjectName("Muted")
                   note.setWordWrap(True)
                   self.wizard_key = ApiKeyPanel()
                   pl.addWidget(head)
@@ -2132,7 +2302,8 @@ jobs:
                   nl = QVBoxLayout(newelle)
                   nl.setContentsMargins(18, 14, 18, 14)
                   nl.setSpacing(6)
-                  nhead = QLabel("\U0001F4AC  Newelle  \u00b7  full AI assistant app")
+                  nhead = QLabel("\U0001F4AC  Newelle  \u00b7  full AI 
+assistant app")
                   nhead.setObjectName("CardName")
                   nnote = QLabel(
                       "When you press Finish, OneOS downloads and sets up Newelle for you (needs internet). "
@@ -2142,7 +2313,8 @@ jobs:
                   )
                   nnote.setObjectName("Muted")
                   nnote.setWordWrap(True)
-                  nl.addWidget(nhead)
+                  
+nl.addWidget(nhead)
                   nl.addWidget(nnote)
                   layout.addWidget(newelle)
                   layout.addStretch()
@@ -2155,7 +2327,8 @@ jobs:
                   skip.setObjectName("Link")
                   skip.clicked.connect(lambda: self.finish_wizard(True))
                   done = QPushButton("Finish  \u2713")
-                  done.setObjectName("Primary")
+                  
+done.setObjectName("Primary")
                   done.clicked.connect(self.save_key_and_finish)
                   nav.addWidget(back)
                   nav.addStretch()
@@ -2168,7 +2341,8 @@ jobs:
                   self.wizard_key.save()
                   self.finish_wizard(True)
 
-              # ------------------------------------------------------------ page 3: hub
+              # ------------------------------------------------------------ page 3: 
+hub
               def page_hub(self):
                   page = QWidget()
                   layout = QVBoxLayout(page)
@@ -2179,7 +2353,8 @@ jobs:
                   sub = QLabel("Version " + self.version + "  \u00b7  Super+Space: Assistant   \u00b7   Super+Shift+C: Circle to Search   \u00b7   Ctrl+Alt+N: Newelle")
                   sub.setObjectName("Sub")
                   layout.addWidget(self.hub_title)
-                  layout.addWidget(sub)
+                  
+layout.addWidget(sub)
                   layout.addSpacing(6)
 
                   self.tile_appearance = Tile("\U0001F3A8", "Appearance", "")
@@ -2187,7 +2362,8 @@ jobs:
                   self.tile_assistant = Tile("\u2726", "Gemini Assistant", "Ask anything  \u00b7  Super+Space")
                   self.tile_assistant.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-gemini-assistant.py"]))
                   self.tile_circle = Tile("\u25ce", "Circle to Search", "Draw around anything  \u00b7  Super+Shift+C")
-                  self.tile_circle.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-circle-search"]))
+                  self.tile_circle.clicked.connect(lambda: 
+self.open_tool(["/usr/local/bin/oneos-circle-search"]))
                   self.tile_newelle = Tile("\U0001F4AC", "Newelle AI", "")
                   self.tile_newelle.clicked.connect(self.open_newelle)
                   self.tile_key = Tile("\U0001F511", "Gemini API key", "")
@@ -2197,14 +2373,16 @@ jobs:
                       self.tile_install.clicked.connect(self.install)
                   else:
                       self.tile_install = Tile("\U0001F6CD\ufe0f", "Software Center", "Apps, Flatpak and updates")
-                      self.tile_install.clicked.connect(lambda: self.open_tool(["plasma-discover"]))
+                      self.tile_install.clicked.connect(lambda: 
+self.open_tool(["plasma-discover"]))
                   self.tile_wine = Tile("\U0001F377", "Windows apps", "Run .exe files with Wine")
                   self.tile_wine.clicked.connect(self.show_wine_guide)
                   self.tile_info = Tile("\U0001F4BB", "System info", "Show hardware and OS details")
                   self.tile_info.clicked.connect(lambda: self.open_tool(["konsole", "--hold", "-e", "fastfetch"]))
                   self.tile_settings = Tile("\u2699\ufe0f", "System Settings", "Wi-Fi, display, sound and more")
                   self.tile_settings.clicked.connect(lambda: self.open_tool(["systemsettings"]))
-                  self.tile_update = Tile("\U0001F504", "Update OneOS", "Install system and Flatpak updates")
+                  self.tile_update = Tile("\U0001F504", "Update OneOS", "Install system and Flatpak 
+updates")
                   self.tile_update.clicked.connect(self.run_updates)
 
                   grid = QGridLayout()
@@ -2217,7 +2395,8 @@ jobs:
                       self.tile_wine, self.tile_info,
                       self.tile_settings, self.tile_update,
                   ]
-                  for index, tile in enumerate(tiles):
+                  for index, tile in 
+enumerate(tiles):
                       grid.addWidget(tile, index // 2, index % 2)
                   layout.addLayout(grid)
                   layout.addStretch()
@@ -2229,7 +2408,8 @@ jobs:
                   self.status = QLabel("")
                   self.status.setObjectName("Muted")
                   close = QPushButton("Close")
-                  close.setObjectName("Secondary")
+                  
+close.setObjectName("Secondary")
                   close.clicked.connect(self.close)
                   footer.addWidget(self.startup_box)
                   footer.addSpacing(14)
@@ -2241,7 +2421,8 @@ jobs:
               def refresh_tiles(self):
                   mode = ui.current_visual_mode()
                   if mode == "glass":
-                      self.tile_appearance.set_texts("Appearance: Liquid Glass", "Click to switch to Sleek Obsidian")
+                      self.tile_appearance.set_texts("Appearance: Liquid Glass", "Click to switch to Sleek 
+Obsidian")
                   else:
                       self.tile_appearance.set_texts("Appearance: Sleek Obsidian", "Click to switch to Liquid Glass")
                   if ui.load_api_key():
@@ -2250,7 +2431,8 @@ jobs:
                       self.tile_key.set_texts("Gemini API key", "Not set. Click to add your free key")
                   if ui.newelle_installed():
                       self.tile_newelle.set_texts("Newelle AI  \u2713", "Open Newelle  \u00b7  quick window: Ctrl+Alt+N")
-                  else:
+                  
+else:
                       self.tile_newelle.set_texts("Install Newelle AI", "Download and set up the full AI assistant")
 
               def toggle_mode(self):
@@ -2260,7 +2442,8 @@ jobs:
                   self.set_status("Switched to " + MODES[new_mode]["name"].split("  ", 1)[1] + ".")
 
               def edit_key(self):
-                  dialog = ApiKeyDialog(self)
+                  dialog = 
+ApiKeyDialog(self)
                   dialog.exec()
                   self.refresh_tiles()
 
@@ -2282,7 +2465,8 @@ jobs:
                   self.open_tool(["konsole", "--hold", "-e", "bash", "-c", script])
 
               def open_tool(self, cmd):
-                  if launch(cmd):
+                  if 
+launch(cmd):
                       self.set_status("Opening " + cmd[0].rsplit("/", 1)[-1] + "...")
                   else:
                       self.set_status(cmd[0].rsplit("/", 1)[-1] + " is not available.")
@@ -2293,7 +2477,8 @@ jobs:
                   else:
                       cmd = ["sudo", "-E", "calamares"]
                   if launch(cmd):
-                      self.set_status("Starting the installer...")
+                      self.set_status("Starting the 
+installer...")
                   else:
                       self.set_status("Could not start the installer.")
 
@@ -2303,7 +2488,8 @@ jobs:
                       "Running Windows apps",
                       "OneOS includes 64-bit and 32-bit Wine, Winetricks and Lutris.\n\n"
                       "1. Open a terminal and run  winecfg  once to create your Wine prefix.\n"
-                      "2. Right-click any .exe in Dolphin and choose Open With > Wine,\n"
+                      "2. Right-click any .exe in Dolphin and choose Open With > 
+Wine,\n"
                       "   or run:  wine /path/to/program.exe\n"
                       "3. Missing fonts or runtimes?  winetricks corefonts vcrun2022 dxvk\n"
                       "4. For games, open Lutris from the application menu.",
@@ -2315,7 +2501,8 @@ jobs:
               app.setApplicationName("OneOS Welcome")
               app.setDesktopFileName("oneos-welcome")
               first_boot = not ui.FIRST_BOOT_FLAG.exists()
-              if "--autostart" in sys.argv and not first_boot and not ui.startup_enabled():
+              if "--autostart" in sys.argv and not first_boot and not 
+ui.startup_enabled():
                   return 0
               window = Welcome(first_boot)
               window.show()
@@ -2327,7 +2514,8 @@ jobs:
           WELCOME_PY_EOF
 
           chmod 0755 \
-            config/includes.chroot/usr/local/bin/oneos-apply-visual-mode \
+            config/includes.chroot/usr/local/bin/oneos-apply-visual-mode 
+\
             config/includes.chroot/usr/local/bin/oneos-gemini-assistant.py \
             config/includes.chroot/usr/local/bin/oneos-circle-search \
             config/includes.chroot/usr/local/bin/oneos-newelle-setup \
@@ -2338,7 +2526,8 @@ jobs:
           cat <<'AUTOSTART_EOF' > config/includes.chroot/etc/xdg/autostart/oneos-welcome.desktop
           [Desktop Entry]
           Type=Application
-          Name=OneOS Welcome
+          Name=OneOS 
+Welcome
           Comment=Set up OneOS and explore its features
           Exec=/usr/local/bin/oneos-welcome --autostart
           Icon=help-about
@@ -2349,7 +2538,8 @@ jobs:
 
           # Login-time retry: if Newelle is not installed yet (no network earlier, closed wizard,
           # or installed from the live ISO) it asks once and offers to set it up.
-          cat <<'NEWELLE_AUTOSTART_EOF' > config/includes.chroot/etc/xdg/autostart/oneos-newelle-setup.desktop
+          cat <<'NEWELLE_AUTOSTART_EOF' > 
+config/includes.chroot/etc/xdg/autostart/oneos-newelle-setup.desktop
           [Desktop Entry]
           Type=Application
           Name=OneOS Newelle Setup
@@ -2382,7 +2572,8 @@ jobs:
           Terminal=false
           StartupNotify=false
           Categories=Utility;
-          GEMINI_DESKTOP_EOF
+          
+GEMINI_DESKTOP_EOF
 
           cat <<'CTS_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-circle-search.desktop
           [Desktop Entry]
@@ -2392,7 +2583,8 @@ jobs:
           Exec=/usr/local/bin/oneos-circle-search
           Icon=draw-freehand
           Terminal=false
-          StartupNotify=false
+          
+StartupNotify=false
           Categories=Utility;
           CTS_DESKTOP_EOF
 
@@ -2401,7 +2593,8 @@ jobs:
           [Desktop Entry]
           Type=Application
           Name=Newelle Quick Window
-          Comment=Open the Newelle AI assistant quick window (Ctrl+Alt+N)
+          Comment=Open the Newelle AI assistant quick window 
+(Ctrl+Alt+N)
           Exec=/usr/local/bin/oneos-newelle-setup --launch-mini
           Icon=io.github.qwersyk.Newelle
           Terminal=false
@@ -2412,7 +2605,8 @@ jobs:
           # Global shortcuts. Circle to Search uses Super+Shift+C because Spectacle owns Super+Shift+S.
           cat <<'SHORTCUTS_EOF' > config/includes.chroot/etc/xdg/kglobalshortcutsrc
           [services][oneos-gemini-assistant.desktop]
-          _launch=Meta+Space,Meta+Space,OneOS Gemini Assistant
+          _launch=Meta+Space,Meta+Space,OneOS Gemini 
+Assistant
 
           [services][oneos-circle-search.desktop]
           _launch=Meta+Shift+C,Meta+Shift+C,OneOS Circle to Search
@@ -2424,7 +2618,8 @@ jobs:
           # ------------------------------------------------------------------
           # Chroot hook: SDDM theme + QML runtime, multi-arch Wine, Brave, wallpapers, services,
           # XFCE purge, build-time sanity checks, size cleanup
-          # ------------------------------------------------------------------
+          # 
+------------------------------------------------------------------
           cat <<'HOOK_EOF' > config/hooks/normal/0500-oneos-customization.hook.chroot
           #!/usr/bin/env bash
           set -euo pipefail
@@ -2434,7 +2629,8 @@ jobs:
 
           # Install packages one by one so a single wrong/missing name never aborts the build
           try_install() {
-            local pkg
+            local 
+pkg
             for pkg in "$@"; do
               if apt-get install "${APT_OPTS[@]}" --no-install-recommends "${pkg}"; then
                 echo "[OneOS] installed ${pkg}"
@@ -2456,7 +2652,8 @@ jobs:
             kde-config-sddm \
             qt6-wayland \
             qml6-module-qtquick \
-            qml6-module-qtquick-controls \
+            qml6-module-qtquick-controls 
+\
             qml6-module-qtquick-layouts \
             qml6-module-qtquick-window \
             qml6-module-qtquick-templates \
@@ -2469,7 +2666,8 @@ jobs:
             kwin-wayland \
             xserver-xorg-video-vmware
 
-          # Pick whichever SDDM theme actually exists
+          # Pick whichever SDDM theme actually 
+exists
           SDDM_THEME=""
           for theme in breeze debian-breeze maldives; do
             if [ -f "/usr/share/sddm/themes/${theme}/Main.qml" ]; then
@@ -2481,7 +2679,8 @@ jobs:
           ls -la /usr/share/sddm/themes/ || true
 
           mkdir -p /etc/sddm.conf.d
-          {
+          
+{
             echo "[General]"
             echo "DisplayServer=x11"
             echo
@@ -2493,7 +2692,8 @@ jobs:
 
           # ---- Windows compatibility -----------------------------------------------------
           apt-get install "${APT_OPTS[@]}" --no-install-recommends \
-            wine \
+            wine 
+\
             wine64 \
             wine32:i386 \
             winetricks \
@@ -2503,7 +2703,8 @@ jobs:
 
           apt-get install "${APT_OPTS[@]}" --no-install-recommends libwine libwine:i386 || true
           apt-get install "${APT_OPTS[@]}" --no-install-recommends virtualbox-guest-x11 virtualbox-guest-utils || true
-          apt-get install "${APT_OPTS[@]}" --no-install-recommends plasma-discover-backend-flatpak || true
+          apt-get install "${APT_OPTS[@]}" --no-install-recommends plasma-discover-backend-flatpak || 
+true
 
           # kwriteconfig is required by oneos-apply-visual-mode
           if ! command -v kwriteconfig6 >/dev/null 2>&1; then
@@ -2513,7 +2714,8 @@ jobs:
           fi
           command -v kwriteconfig6 >/dev/null 2>&1 || echo "[OneOS] WARNING: kwriteconfig6 is missing; visual profiles will not apply"
 
-          # Flathub (system-wide) for the Software Center. Newelle itself is installed per-user
+          # Flathub (system-wide) for the Software Center. Newelle itself is installed 
+per-user
           # after the first-boot wizard, so it is not baked into the ISO (keeps the ISO small).
           flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
 
@@ -2521,7 +2723,8 @@ jobs:
           install -m 0755 -d /usr/share/keyrings
           curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
             https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
-          chmod a+r /usr/share/keyrings/brave-browser-archive-keyring.gpg
+          chmod a+r 
+/usr/share/keyrings/brave-browser-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg arch=amd64] https://brave-browser-apt-release.s3.brave.com/ stable main" \
             > /etc/apt/sources.list.d/brave-browser-release.list
           apt-get update
@@ -2530,7 +2733,8 @@ jobs:
           # Wallpapers for both visual profiles (generated, no extra download)
           mkdir -p /usr/share/backgrounds/oneos
           python3 - <<'WALLPAPER_PY'
-          from PIL import Image, ImageChops, ImageDraw, ImageFilter
+          from PIL import Image, ImageChops, ImageDraw, 
+ImageFilter
 
           SMALL = (640, 360)
           FULL = (2560, 1440)
@@ -2542,7 +2746,8 @@ jobs:
               layer = Image.new("RGB", SMALL, (0, 0, 0))
               draw = ImageDraw.Draw(layer)
               for cx, cy, radius, color in glows:
-                  draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
+                  draw.ellipse((cx - radius, cy - radius, cx + radius, cy + 
+radius), fill=color)
               layer = layer.filter(ImageFilter.GaussianBlur(60))
               image = ImageChops.add(base, layer).resize(FULL, Image.BICUBIC)
               image.save(path, optimize=True)
@@ -2551,7 +2756,8 @@ jobs:
           make("/usr/share/backgrounds/oneos/oneos-obsidian.png", (10, 12, 20), (24, 30, 52),
                [(470, 70, 140, (30, 44, 96)), (120, 330, 120, (22, 30, 70))])
           make("/usr/share/backgrounds/oneos/oneos-glass.png", (22, 28, 74), (14, 40, 78),
-               [(130, 90, 150, (96, 70, 200)), (520, 280, 170, (30, 150, 210)), (330, 330, 120, (120, 60, 170))])
+               [(130, 90, 150, (96, 70, 200)), (520, 280, 170, (30, 150, 210)), (330, 330, 120, (120, 60, 
+170))])
           WALLPAPER_PY
 
           # Remove XFCE completely
@@ -2563,7 +2769,8 @@ jobs:
             'xfce4-panel*' \
             'xfce4-session*' || true
 
-          rm -f /usr/share/xsessions/*xfce*.desktop /usr/share/wayland-sessions/*xfce*.desktop
+          rm -f /usr/share/xsessions/*xfce*.desktop 
+/usr/share/wayland-sessions/*xfce*.desktop
 
           echo "TASKSEL_DEFAULT=kde" > /etc/default/tasksel
           echo "/usr/sbin/sddm" > /etc/X11/default-display-manager
@@ -2575,7 +2782,8 @@ jobs:
           echo "RESUME=none" > /etc/initramfs-tools/conf.d/resume
           update-initramfs -u -k all || true
 
-          # ---- Build-time sanity checks: fail the build instead of shipping a broken login screen
+          # ---- Build-time sanity checks: fail the build instead of 
+shipping a broken login screen
           echo "[OneOS] Verifying the login stack..."
           FAIL=0
           if ! ls /usr/lib/x86_64-linux-gnu/qt6/qml/QtQuick/Controls >/dev/null 2>&1; then
@@ -2586,7 +2794,8 @@ jobs:
             echo "[OneOS] ERROR: no SDDM theme was installed"
             FAIL=1
           fi
-          if [ ! -x /usr/sbin/sddm ] || [ ! -x /usr/libexec/sddm-helper ] && [ ! -x /usr/lib/x86_64-linux-gnu/sddm/sddm-helper ]; then
+          if [ ! -x /usr/sbin/sddm ] || [ ! -x /usr/libexec/sddm-helper ] 
+&& [ ! -x /usr/lib/x86_64-linux-gnu/sddm/sddm-helper ]; then
             echo "[OneOS] WARNING: sddm helper binary not found at the usual paths"
           fi
           if ! ls /usr/share/xsessions/plasma*.desktop /usr/share/wayland-sessions/plasma*.desktop >/dev/null 2>&1; then
@@ -2595,7 +2804,8 @@ jobs:
           fi
           ls /usr/share/xsessions/ /usr/share/wayland-sessions/ 2>/dev/null || true
           if [ "${FAIL}" -ne 0 ]; then
-            echo "[OneOS] Login stack verification failed."
+            echo "[OneOS] Login stack verification 
+failed."
             exit 1
           fi
 
@@ -2606,7 +2816,8 @@ jobs:
 
           chmod 0755 config/hooks/normal/0500-oneos-customization.hook.chroot
 
-          echo "[OneOS] Running lb build..."
+          echo "[OneOS] Running lb 
+build..."
           lb build 2>&1 | tee /workspace/lb-build.log
 
           ISO_FILE="$(find "${WORKDIR}" -maxdepth 1 -type f -name '*.iso' | head -n 1)"
@@ -2616,7 +2827,8 @@ jobs:
           fi
 
           mv -f "${ISO_FILE}" "/workspace/OneOS-v${ONEOS_VERSION}.iso"
-          ls -lh "/workspace/OneOS-v${ONEOS_VERSION}.iso"
+          ls -lh 
+"/workspace/OneOS-v${ONEOS_VERSION}.iso"
           echo "[OneOS] Successfully compiled /workspace/OneOS-v${ONEOS_VERSION}.iso"
           BUILD_SCRIPT_EOF
 
@@ -2627,7 +2839,8 @@ jobs:
           docker run --rm --privileged \
             -e ONEOS_VERSION \
             -v "${GITHUB_WORKSPACE}:/workspace" \
-            -v "/var/cache/apt/archives:/var/cache/apt/archives" \
+            -v "/var/cache/apt/archives:/var/cache/apt/archives" 
+\
             -w /workspace \
             debian:trixie \
             /bin/bash /workspace/build-oneos.sh
@@ -2640,7 +2853,8 @@ jobs:
           path: lb-build.log
           if-no-files-found: ignore
 
-      - name: Checksum ISO and Split Only If Over GitHub 2GB Limit
+      - name: Checksum ISO and Split Only If Over GitHub 2GB 
+Limit
         run: |
           cd "${GITHUB_WORKSPACE}"
           ISO="OneOS-v${ONEOS_VERSION}.iso"
@@ -2652,7 +2866,8 @@ jobs:
             split -b 1900M -d "${ISO}" "${ISO}.part"
             rm -f "${ISO}"
           fi
-          ls -lh "${ISO}"*
+          ls -lh 
+"${ISO}"*
 
       - name: Publish OneOS ISO to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -2663,16 +2878,19 @@ jobs:
             ## OneOS v${{ env.ONEOS_VERSION }} (Debian 13 Trixie, amd64)
 
             ### What's new in the experience
-            - **First-boot wizard:** a guided setup for your look, your Gemini key and your shortcuts, with a one-click **Install to disk** option in the live session.
+            - **First-boot wizard:** a guided setup for your look, your 
+Gemini key and your shortcuts, with a one-click **Install to disk** option in the live session.
             - **Newelle AI, installed for you:** when the wizard finishes, OneOS downloads **Newelle** from Flathub, applies sensible permissions (host command access, home folder) and Konsole as its terminal, then starts it so Newelle's own first-run setup guides you. Open the quick window any time with `Ctrl + Alt + N`. If you were offline or skipped, OneOS offers to set it up again at your next login.
             - **OneOS Welcome hub:** one window for appearance, AI, software, updates, Wine and system tools. Optional at login.
-            - **OneOS Assistant (`Super + Space`):** a Spotlight-style Gemini chat with conversation history, Markdown answers, copy buttons, clipboard quick actions and friendly error messages.
+            - **OneOS Assistant (`Super + Space`):** a Spotlight-style Gemini chat with conversation history, Markdown answers, copy buttons, clipboard quick actions and friendly error 
+messages.
             - **Circle to Search (`Super + Shift + C`):** draw freely around anything on screen, then ask Gemini about it.
             - **Two visual profiles:** ✨ Liquid Glass (KWin blur, translucent apps, aurora wallpaper) and ⚡ Sleek Obsidian (matte, zero GPU overhead), switchable live without logging out.
             - **Out-of-the-box polish:** Inter font, Papirus-Dark icons, blue accent, audio, Bluetooth, Wi-Fi, Flatpak/Flathub and Software Center.
 
             ### Fixed in this release
-            - **Login screen:** the SDDM greeter theme and its Qt6 QML modules are now installed explicitly, the theme is auto-selected, and the build fails early if the login stack is incomplete.
+            - **Login screen:** the SDDM greeter theme and its Qt6 QML modules are now installed explicitly, the theme is auto-selected, and the build fails early if the login stack is 
+incomplete.
             - **Live autologin:** the session file is detected at boot (X11 first, which is the most reliable choice in virtual machines) and the service is enabled directly in the image.
 
             ### Included
@@ -2680,7 +2898,8 @@ jobs:
             - Multi-arch Wine (`amd64` + `i386`), Winetricks, Lutris, Brave Browser, Calamares installer, VM guest drivers
             - ZRAM (`zstd`), tuned `sysctl`, Baloo indexing disabled for low-end hardware
 
-            ### Notes
+            ### 
+Notes
             - Newelle needs an internet connection and about 4 GB of free space. In a small live session it is set up after you install OneOS to disk.
             - Newelle is granted access to your home folder and can run commands outside its sandbox. Review what it suggests before approving commands.
 
@@ -2689,7 +2908,8 @@ jobs:
             sha256sum -c OneOS-v${{ env.ONEOS_VERSION }}.iso.sha256
             ```
             If the ISO is split into `.part00`, `.part01`, ... join it first:
-            ```
+            
+```
             cat OneOS-v${{ env.ONEOS_VERSION }}.iso.part* > OneOS-v${{ env.ONEOS_VERSION }}.iso
             ```
           files: |
