@@ -133,7 +133,7 @@ jobs:
             --iso-publisher "OneOS Project" \
             --iso-volume "OneOS_v${ONEOS_VERSION}" \
             --apt-recommends false \
-            --apt-indices false \
+            --apt-indices true \
             --cache-packages true
 
           echo 'MKSQUASHFS_OPTIONS="-comp xz -Xbcj x86 -b 1M -Xdict-size 100%"' >> config/common
@@ -2628,6 +2628,15 @@ jobs:
           systemctl enable zramswap.service || true
 
           echo "RESUME=none" > /etc/initramfs-tools/conf.d/resume
+          # ---- Bootloader for the Calamares installer ------------------------------------
+          # Debian's calamares-bootloader-config runs "apt-get -y install grub-pc" (BIOS) or
+          # "grub-efi-amd64" (UEFI) inside the freshly copied system. If grub-pc is not already in
+          # the image, BIOS installs fail with "Package 'grub-pc' has no installation candidate".
+          # Pre-installing it makes that apt call a no-op. UEFI installs fetch grub-efi-amd64 from
+          # the network, which works because the apt package lists are kept in the image.
+          try_install grub-pc
+          mkdir -p /boot/grub
+
           update-initramfs -u -k all || true
 
           # ---- Build-time sanity checks: fail the build instead of shipping a broken login screen
@@ -2649,6 +2658,13 @@ jobs:
             FAIL=1
           fi
           ls /usr/share/xsessions/ /usr/share/wayland-sessions/ 2>/dev/null || true
+          for pkg in grub-pc grub-common grub-pc-bin squashfs-tools; do
+            if ! dpkg -s "${pkg}" 2>/dev/null | grep -q "^Status: install ok installed"; then
+              echo "[OneOS] ERROR: ${pkg} is not installed; the installer would fail"
+              FAIL=1
+            fi
+          done
+          [ -f /etc/default/grub ] || { echo "[OneOS] ERROR: /etc/default/grub is missing"; FAIL=1; }
           if [ "${FAIL}" -ne 0 ]; then
             echo "[OneOS] Login stack verification failed."
             exit 1
@@ -2657,7 +2673,7 @@ jobs:
           touch /var/lib/oneos-hook-done
           apt-get autoremove -y --purge || true
           apt-get clean
-          rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /tmp/*
+          rm -rf /usr/share/doc/* /usr/share/man/* /tmp/*
           HOOK_EOF
 
           cp config/hooks/normal/0500-oneos-customization.hook.chroot \
