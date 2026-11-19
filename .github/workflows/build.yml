@@ -143,6 +143,7 @@ jobs:
             config/apt \
             config/archives \
             config/hooks/normal \
+            config/hooks/live \
             config/includes.chroot/etc/apt/preferences.d \
             config/includes.chroot/etc/default \
             config/includes.chroot/etc/X11 \
@@ -246,6 +247,8 @@ jobs:
           # It also sets the live user's password (oneos / 1234) once live-config has created the account.
           cat <<'LIVE_AUTOLOGIN_EOF' > config/includes.chroot/usr/local/lib/oneos/live-autologin.sh
           #!/bin/sh
+          exec >>/var/log/oneos-live-autologin.log 2>&1
+          set -x
           SESSION=""
           for candidate in \
             /usr/share/xsessions/plasmax11.desktop \
@@ -258,14 +261,32 @@ jobs:
           done
           [ -n "${SESSION}" ] || SESSION="plasmax11.desktop"
 
-          # Wait (up to 30 s) for live-config to create the oneos user, then set its password
+          # Wait (up to 45 s) for live-config to create the oneos user
           i=0
-          while ! id oneos >/dev/null 2>&1 && [ "${i}" -lt 30 ]; do
+          while ! id oneos >/dev/null 2>&1 && [ "${i}" -lt 45 ]; do
             sleep 1
             i=$((i + 1))
           done
+
+          # Fallback: if live-config never created the account, create it here
+          if ! id oneos >/dev/null 2>&1; then
+            echo "live-config did not create oneos; creating it now"
+            useradd -m -u 1000 -s /bin/bash oneos || useradd -m -s /bin/bash oneos
+          fi
+          for g in sudo audio video plugdev netdev cdrom bluetooth lpadmin scanner; do
+            getent group "${g}" >/dev/null 2>&1 && usermod -aG "${g}" oneos
+          done
+          mkdir -p /etc/sudoers.d
+          echo "oneos ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/oneos-live
+          chmod 0440 /etc/sudoers.d/oneos-live
+
+          # Known password, unlocked, never expiring (addresses "Authentication failure")
           echo "oneos:1234" | chpasswd
           passwd -u oneos >/dev/null 2>&1 || true
+          chage -E -1 -M -1 -I -1 oneos 2>/dev/null || true
+          usermod -s /bin/bash oneos 2>/dev/null || true
+          grep -qx /bin/bash /etc/shells || echo /bin/bash >> /etc/shells
+          chown -R oneos:oneos /home/oneos 2>/dev/null || true
 
           mkdir -p /etc/sddm.conf.d
           cat > /etc/sddm.conf.d/20-oneos-live-autologin.conf <<INNER_EOF
@@ -2439,6 +2460,13 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
+          # Installed in config/hooks/normal AND config/hooks/live; run only once
+          if [ -f /var/lib/oneos-hook-done ]; then
+            echo "ONEOS-HOOK-RAN: already done, skipping duplicate"
+            exit 0
+          fi
+          echo "ONEOS-HOOK-RAN: 0500-oneos-customization starting"
+
           export DEBIAN_FRONTEND=noninteractive
           APT_OPTS=(-y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
@@ -2609,15 +2637,22 @@ jobs:
             exit 1
           fi
 
+          touch /var/lib/oneos-hook-done
           apt-get autoremove -y --purge || true
           apt-get clean
           rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /tmp/*
           HOOK_EOF
 
-          chmod 0755 config/hooks/normal/0500-oneos-customization.hook.chroot
+          cp config/hooks/normal/0500-oneos-customization.hook.chroot \
+             config/hooks/live/0500-oneos-customization.hook.chroot
+          chmod 0755 config/hooks/normal/0500-oneos-customization.hook.chroot \
+                     config/hooks/live/0500-oneos-customization.hook.chroot
 
           echo "[OneOS] Running lb build..."
           lb build 2>&1 | tee /workspace/lb-build.log
+
+          grep -q "ONEOS-HOOK-RAN" /workspace/lb-build.log \
+            || { echo "[OneOS] ERROR: customization hook never ran; refusing to ship a stock ISO" >&2; exit 1; }
 
           ISO_FILE="$(find "${WORKDIR}" -maxdepth 1 -type f -name '*.iso' | head -n 1)"
           if [ -z "${ISO_FILE}" ]; then
@@ -2642,8 +2677,46 @@ jobs:
             debian:trixie \
             /bin/bash /workspace/build-oneos.sh
 
-      - name: Upload Build Log on Failure
-        if: failure()
+      - name: Boot-test the ISO in QEMU (diagnostics, never blocks the release)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 socat imagemagick >/dev/null
+          ISO="${GITHUB_WORKSPACE}/OneOS-v${ONEOS_VERSION}.iso"
+          mkdir -p "${GITHUB_WORKSPACE}/boot-test"
+          OUT="${GITHUB_WORKSPACE}/boot-test"
+          ACCEL=tcg; CPU=max
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; ACCEL=kvm; CPU=host; fi
+          echo "QEMU accel: ${ACCEL}" | tee "${OUT}/info.txt"
+          qemu-system-x86_64 -machine accel=${ACCEL} -cpu ${CPU} -m 4096 -smp 2 \
+            -cdrom "${ISO}" -boot d -vga std -display none \
+            -monitor unix:/tmp/qemu-mon.sock,server,nowait &
+          QPID=$!
+          sleep 25
+          echo "sendkey ret" | socat - UNIX-CONNECT:/tmp/qemu-mon.sock
+          for t in 90 180 300 420 540; do
+            sleep $((t - $(cat /tmp/last 2>/dev/null || echo 0)))
+            echo "${t}" > /tmp/last
+            echo "screendump ${OUT}/t${t}.ppm" | socat - UNIX-CONNECT:/tmp/qemu-mon.sock
+          done
+          kill "${QPID}" 2>/dev/null
+          for f in "${OUT}"/*.ppm; do
+            convert "$f" "${f%.ppm}.png" && rm -f "$f"
+          done
+          ls -l "${OUT}"
+
+      - name: Upload Boot-Test Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneos-boot-test
+          path: boot-test/
+          if-no-files-found: ignore
+
+      - name: Upload Build Log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oneos-build-log
