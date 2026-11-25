@@ -2747,13 +2747,20 @@ jobs:
           for f in usr/bin/unsquashfs usr/bin/rsync usr/sbin/grub-install usr/bin/calamares \
                    etc/calamares/modules/unpackfs.conf etc/calamares/settings.conf \
                    etc/oneos-release usr/local/lib/oneos/live-autologin.sh \
-                   etc/systemd/system/oneos-live-autologin.service; do
+                   etc/systemd/system/oneos-live-autologin.service \
+                   etc/default/grub usr/sbin/grub-mkconfig; do
             if grep -qE " squashfs-root/${f}( ->.*)?$" /tmp/audit/list.txt; then
               echo "OK       ${f}"
             else
               echo "MISSING  ${f}"; FAIL=1
             fi
           done
+          if grep -qE " squashfs-root/var/lib/apt/lists/.*_Packages" /tmp/audit/list.txt; then
+            echo "OK       apt package lists present (Calamares can install grub-pc / grub-efi-amd64)"
+          else
+            echo "MISSING  apt package lists in /var/lib/apt/lists"; FAIL=1
+          fi
+          grep -qE " squashfs-root/boot/grub( |$)" /tmp/audit/list.txt && echo "OK       boot/grub" || { echo "MISSING  boot/grub"; FAIL=1; }
           echo "---- /etc/calamares/modules/unpackfs.conf inside the image ----"
           unsquashfs -cat /tmp/audit/fs.squashfs etc/calamares/modules/unpackfs.conf 2>&1 | head -30
           echo "---- squashfs-tools / calamares versions inside the image ----"
