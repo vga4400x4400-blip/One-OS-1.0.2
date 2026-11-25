@@ -317,6 +317,16 @@ jobs:
           ln -sf /etc/systemd/system/oneos-live-autologin.service \
             config/includes.chroot/etc/systemd/system/graphical.target.wants/oneos-live-autologin.service
 
+          # Known-good Calamares unpackfs config: copy the system from the live medium's squashfs
+          mkdir -p config/includes.chroot/etc/calamares/modules
+          cat <<'UNPACKFS_EOF' > config/includes.chroot/etc/calamares/modules/unpackfs.conf
+          ---
+          unpack:
+              - source: "/run/live/medium/live/filesystem.squashfs"
+                sourcefs: "squashfs"
+                destination: ""
+          UNPACKFS_EOF
+
           # Kvantum translucent config for Liquid Glass mode
           cat <<'KV_GLASS_EOF' > config/includes.chroot/usr/share/Kvantum/OneOSGlass/OneOSGlass.kvconfig
           [%General]
@@ -2336,10 +2346,11 @@ jobs:
                       self.set_status(cmd[0].rsplit("/", 1)[-1] + " is not available.")
 
               def install(self):
-                  if shutil.which("install-debian"):
+                  cmd = ["sudo", "-E", "env",
+                         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                         "calamares"]
+                  if not shutil.which("sudo") and shutil.which("install-debian"):
                       cmd = ["install-debian"]
-                  else:
-                      cmd = ["sudo", "-E", "calamares"]
                   if launch(cmd):
                       self.set_status("Starting the installer...")
                   else:
@@ -2637,6 +2648,17 @@ jobs:
           try_install grub-pc
           mkdir -p /boot/grub
 
+          # ---- Calamares prerequisites: unsquashfs must exist and must survive autoremove -----
+          try_install squashfs-tools rsync
+          apt-mark manual squashfs-tools rsync calamares calamares-settings-debian grub-pc >/dev/null 2>&1 || true
+          UNSQ="$(command -v unsquashfs || true)"
+          if [ -z "${UNSQ}" ]; then
+            echo "[OneOS] ERROR: unsquashfs is missing from the image; the installer would fail"
+            exit 1
+          fi
+          ln -sf "${UNSQ}" /usr/local/bin/unsquashfs
+          echo "[OneOS] unsquashfs OK at ${UNSQ}"
+
           update-initramfs -u -k all || true
 
           # ---- Build-time sanity checks: fail the build instead of shipping a broken login screen
@@ -2709,6 +2731,39 @@ jobs:
             -w /workspace \
             debian:trixie \
             /bin/bash /workspace/build-oneos.sh
+
+      - name: Audit finished ISO for Calamares installer prerequisites
+        run: |
+          set -uo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends squashfs-tools xorriso >/dev/null
+          ISO="${GITHUB_WORKSPACE}/OneOS-v${ONEOS_VERSION}.iso"
+          mkdir -p /tmp/audit
+          xorriso -osirrox on -indev "${ISO}" -extract /live/filesystem.squashfs /tmp/audit/fs.squashfs >/dev/null 2>&1
+          test -s /tmp/audit/fs.squashfs || { echo "ERROR: live/filesystem.squashfs missing from the ISO"; exit 1; }
+          ls -lh /tmp/audit/fs.squashfs
+          unsquashfs -ll /tmp/audit/fs.squashfs > /tmp/audit/list.txt
+          FAIL=0
+          for f in usr/bin/unsquashfs usr/bin/rsync usr/sbin/grub-install usr/bin/calamares \
+                   etc/calamares/modules/unpackfs.conf etc/calamares/settings.conf \
+                   etc/oneos-release usr/local/lib/oneos/live-autologin.sh \
+                   etc/systemd/system/oneos-live-autologin.service; do
+            if grep -qE " squashfs-root/${f}( ->.*)?$" /tmp/audit/list.txt; then
+              echo "OK       ${f}"
+            else
+              echo "MISSING  ${f}"; FAIL=1
+            fi
+          done
+          echo "---- /etc/calamares/modules/unpackfs.conf inside the image ----"
+          unsquashfs -cat /tmp/audit/fs.squashfs etc/calamares/modules/unpackfs.conf 2>&1 | head -30
+          echo "---- squashfs-tools / calamares versions inside the image ----"
+          unsquashfs -cat /tmp/audit/fs.squashfs var/lib/dpkg/status 2>/dev/null \
+            | awk '/^Package: (squashfs-tools|calamares|calamares-settings-debian|rsync|grub-pc)$/{p=1} p&&/^(Package|Status|Version):/{print} /^$/{p=0}'
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "ERROR: the ISO is missing files the installer needs; not publishing it"
+            exit 1
+          fi
+          echo "Installer prerequisites are present in the ISO."
 
       - name: Boot-test the ISO in QEMU (diagnostics, never blocks the release)
         continue-on-error: true
