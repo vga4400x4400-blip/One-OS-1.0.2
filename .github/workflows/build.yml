@@ -317,16 +317,6 @@ jobs:
           ln -sf /etc/systemd/system/oneos-live-autologin.service \
             config/includes.chroot/etc/systemd/system/graphical.target.wants/oneos-live-autologin.service
 
-          # Known-good Calamares unpackfs config: copy the system from the live medium's squashfs
-          mkdir -p config/includes.chroot/etc/calamares/modules
-          cat <<'UNPACKFS_EOF' > config/includes.chroot/etc/calamares/modules/unpackfs.conf
-          ---
-          unpack:
-              - source: "/run/live/medium/live/filesystem.squashfs"
-                sourcefs: "squashfs"
-                destination: ""
-          UNPACKFS_EOF
-
           # Kvantum translucent config for Liquid Glass mode
           cat <<'KV_GLASS_EOF' > config/includes.chroot/usr/share/Kvantum/OneOSGlass/OneOSGlass.kvconfig
           [%General]
@@ -595,6 +585,7 @@ jobs:
           #!/usr/bin/env python3
           """Shared helpers for the OneOS desktop tools (Welcome, Assistant, Circle to Search)."""
           import os
+          import re
           import subprocess
           from pathlib import Path
 
@@ -612,7 +603,19 @@ jobs:
           NEWELLE_SETUP = "/usr/local/bin/oneos-newelle-setup"
 
           API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-          DEFAULT_MODEL = "gemini-2.5-flash"
+          DEFAULT_MODEL = "gemini-3.8-flash"
+          # Tried in order when the chosen model is gone or has no quota. The list Google returns for the
+          # user's key (discover_models) is tried first.
+          FALLBACK_MODELS = [
+              "gemini-3.8-flash",
+              "gemini-3.6-flash",
+              "gemini-3.5-flash-lite",
+              "gemini-3.1-flash-lite",
+              "gemini-2.5-flash",
+          ]
+          MODEL_CACHE = CONF_DIR / "gemini_model.cache"
+          MODEL_PATTERN = re.compile(r"^gemini-(\d+(?:\.\d+)*)-flash(-lite)?$")
+          MAX_MODEL_TRIES = 6
           KEY_URL = "https://aistudio.google.com/apikey"
           SYSTEM_PROMPT = (
               "You are OneOS Assistant, built into a Debian KDE Plasma desktop. "
@@ -670,8 +673,29 @@ jobs:
               write_env_file(data)
 
 
+          def read_cached_model():
+              try:
+                  return MODEL_CACHE.read_text(encoding="utf-8").strip()
+              except OSError:
+                  return ""
+
+
+          def remember_model(name):
+              try:
+                  CONF_DIR.mkdir(parents=True, exist_ok=True)
+                  MODEL_CACHE.write_text(name + "\n", encoding="utf-8")
+              except OSError:
+                  pass
+
+
+          def user_model_override():
+              """A model the user set on purpose (GEMINI_MODEL in the environment or gemini.env)."""
+              return os.environ.get("GEMINI_MODEL", "").strip() or read_env_file().get("GEMINI_MODEL", "").strip()
+
+
           def load_model():
-              return os.environ.get("GEMINI_MODEL", "").strip() or read_env_file().get("GEMINI_MODEL") or DEFAULT_MODEL
+              """The model tried first: user override, then the last one that worked, then the default."""
+              return user_model_override() or read_cached_model() or DEFAULT_MODEL
 
 
           def current_visual_mode():
@@ -742,7 +766,8 @@ jobs:
               if code in (401, 403):
                   return "Gemini refused this API key (permission denied). Check the key in OneOS Welcome."
               if code == 404:
-                  return "That Gemini model was not found. Set GEMINI_MODEL in ~/.config/oneos/gemini.env."
+                  return ("No Gemini model is available to this key right now. OneOS already tried the newest "
+                          "models. Check that the key is valid and the Gemini API is enabled in Google AI Studio.")
               if code == 429:
                   return "Gemini rate limit or free quota reached. Wait a minute and try again."
               if code >= 500:
@@ -750,18 +775,66 @@ jobs:
               return "Gemini error " + str(code) + ((": " + message) if message else ".")
 
 
-          def gemini_generate(contents, api_key, model=None):
-              url = API_BASE + "/models/" + (model or load_model()) + ":generateContent"
+          def _model_rank(name):
+              """Sort key: newest version first, full Flash before Flash-Lite. None if not a text Flash model."""
+              match = MODEL_PATTERN.match(name)
+              if not match:
+                  return None
+              version = tuple(int(part) for part in match.group(1).split("."))
+              return (version, 0 if not match.group(2) else -1)
+
+
+          def discover_models(api_key):
+              """Ask Google which Flash models this key can call, newest first. [] if unknown."""
+              names = []
+              token = ""
+              for _ in range(5):
+                  url = API_BASE + "/models?pageSize=1000" + (("&pageToken=" + token) if token else "")
+                  try:
+                      resp = requests.get(url, headers=_headers(api_key), timeout=20)
+                  except requests.exceptions.RequestException:
+                      return []
+                  if resp.status_code != 200:
+                      return []
+                  data = resp.json()
+                  for item in data.get("models", []):
+                      if "generateContent" not in (item.get("supportedGenerationMethods") or []):
+                          continue
+                      name = item.get("name", "").split("/")[-1]
+                      if _model_rank(name) is not None:
+                          names.append(name)
+                  token = data.get("nextPageToken", "")
+                  if not token:
+                      break
+              return sorted(set(names), key=_model_rank, reverse=True)
+
+
+          def _request(model, contents, api_key):
+              url = API_BASE + "/models/" + model + ":generateContent"
               payload = {
                   "contents": contents,
                   "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
               }
               try:
-                  resp = requests.post(url, headers=_headers(api_key), json=payload, timeout=60)
+                  return requests.post(url, headers=_headers(api_key), json=payload, timeout=60)
               except requests.exceptions.RequestException as exc:
                   raise GeminiError(_network_message(exc))
-              if resp.status_code != 200:
-                  raise GeminiError(_explain_http_error(resp))
+
+
+          def _model_problem(resp):
+              """True when the error is about the model (retired, no quota), not the key or the network."""
+              if resp.status_code in (404, 429):
+                  return True
+              if resp.status_code == 400:
+                  try:
+                      message = resp.json().get("error", {}).get("message", "").lower()
+                  except ValueError:
+                      return False
+                  return "model" in message and "api key" not in message
+              return False
+
+
+          def _read_answer(resp):
               data = resp.json()
               candidates = data.get("candidates") or []
               if not candidates:
@@ -772,13 +845,46 @@ jobs:
               return text or "_Gemini returned an empty response._"
 
 
+          def gemini_generate(contents, api_key, model=None):
+              """Answer with the chosen model. If it is retired or out of quota, try newer ones and remember the one that works."""
+              first = model or load_model()
+              resp = _request(first, contents, api_key)
+              if resp.status_code == 200:
+                  return _read_answer(resp)
+              if not _model_problem(resp):
+                  raise GeminiError(_explain_http_error(resp))
+
+              last = resp
+              transient = resp.status_code == 429  # a busy moment, not a retired model: do not downgrade for good
+              tried = [first]
+              for name in discover_models(api_key) + FALLBACK_MODELS:
+                  if name in tried:
+                      continue
+                  if len(tried) >= MAX_MODEL_TRIES:
+                      break
+                  tried.append(name)
+                  resp = _request(name, contents, api_key)
+                  if resp.status_code == 200:
+                      if not user_model_override() and not transient:
+                          remember_model(name)
+                      return _read_answer(resp)
+                  last = resp
+                  if not _model_problem(resp):
+                      break
+              raise GeminiError(_explain_http_error(last))
+
+
           def test_api_key(api_key):
+              """Validate the key and remember the best Flash model it can use."""
               try:
                   resp = requests.get(API_BASE + "/models?pageSize=1", headers=_headers(api_key), timeout=20)
               except requests.exceptions.RequestException as exc:
                   raise GeminiError(_network_message(exc))
               if resp.status_code != 200:
                   raise GeminiError(_explain_http_error(resp))
+              found = discover_models(api_key)
+              if found and not user_model_override():
+                  remember_model(found[0])
               return True
 
 
@@ -1035,10 +1141,10 @@ jobs:
                   hl.setSpacing(8)
                   title = QLabel("\u2726  OneOS Assistant")
                   title.setObjectName("Title")
-                  chip = QLabel(ui.load_model())
-                  chip.setObjectName("ModelChip")
+                  self.model_chip = QLabel(ui.load_model())
+                  self.model_chip.setObjectName("ModelChip")
                   hl.addWidget(title)
-                  hl.addWidget(chip)
+                  hl.addWidget(self.model_chip)
                   hl.addStretch()
                   circle_btn = QPushButton("\u25ce  Circle to Search")
                   circle_btn.setToolTip("Draw around anything on screen (Super+Shift+C)")
@@ -1303,6 +1409,7 @@ jobs:
                       return
                   if not local:
                       self.history.append({"role": "model", "parts": [{"text": result}]})
+                      self.model_chip.setText(ui.load_model())
                   self.add_bubble(result, "ai")
 
               # ------------------------------------------------------------ actions
@@ -1721,6 +1828,7 @@ jobs:
               QLineEdit,
               QMessageBox,
               QPushButton,
+              QScrollArea,
               QStackedWidget,
               QVBoxLayout,
               QWidget,
@@ -1928,6 +2036,206 @@ jobs:
                   "inner": "background-color: #1B2036; border: 1px solid #2F3A5E;",
               },
           }
+
+
+          NEWELLE_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+          class NewelleGeminiDialog(QDialog):
+              """Newelle's built-in Gemini list is fixed and old, so use its OpenAI-compatible provider instead."""
+
+              def __init__(self, parent):
+                  super().__init__(parent)
+                  self.setObjectName("Root")
+                  self.setStyleSheet(STYLE)
+                  self.setWindowTitle("Use the newest Gemini in Newelle")
+                  self.setFixedSize(600, 580)
+                  layout = QVBoxLayout(self)
+                  layout.setContentsMargins(24, 22, 24, 20)
+                  layout.setSpacing(10)
+                  title = QLabel("Use the newest Gemini in Newelle")
+                  title.setObjectName("H2")
+                  why = QLabel(
+                      "Newelle's own Gemini entry only lists a few old models. Google also lets apps use Gemini "
+                      "through an OpenAI-compatible address, which accepts the newest models. Do this once:"
+                  )
+                  why.setObjectName("Sub")
+                  why.setWordWrap(True)
+                  steps = QLabel(
+                      "1. In Newelle open Settings, then the LLM / language model section.\n"
+                      "2. Choose the provider  OpenAI API  (not Google Gemini).\n"
+                      "3. Paste the values below into API Endpoint, Model and API Key (Copy buttons).\n"
+                      "4. Start a new chat. If a menu is named differently, use the field with the same name."
+                  )
+                  steps.setObjectName("Muted")
+                  steps.setWordWrap(True)
+                  layout.addWidget(title)
+                  layout.addWidget(why)
+                  layout.addWidget(steps)
+                  layout.addSpacing(6)
+
+                  self._row(layout, "API Endpoint", NEWELLE_GEMINI_ENDPOINT, False)
+                  self.model_edit = self._row(layout, "Model", ui.load_model(), False)
+                  self._row(layout, "API Key", ui.load_api_key(), True)
+
+                  self.note = QLabel("")
+                  self.note.setObjectName("Muted")
+                  self.note.setWordWrap(True)
+                  layout.addWidget(self.note)
+                  layout.addStretch()
+
+                  row = QHBoxLayout()
+                  self.refresh_btn = QPushButton("Find newest model")
+                  self.refresh_btn.setObjectName("Secondary")
+                  self.refresh_btn.clicked.connect(self.find_model)
+                  close = QPushButton("Done")
+                  close.setObjectName("Primary")
+                  close.clicked.connect(self.accept)
+                  row.addWidget(self.refresh_btn)
+                  row.addStretch()
+                  row.addWidget(close)
+                  layout.addLayout(row)
+                  if not ui.load_api_key():
+                      self.note.setText("No Gemini key saved yet. Add it with the Gemini API key tile, then reopen this guide.")
+
+              def _row(self, layout, label, value, secret):
+                  caption = QLabel(label)
+                  caption.setObjectName("CardName")
+                  layout.addWidget(caption)
+                  line = QHBoxLayout()
+                  edit = QLineEdit(value)
+                  edit.setReadOnly(True)
+                  if secret:
+                      edit.setEchoMode(QLineEdit.EchoMode.Password)
+                  copy = QPushButton("Copy")
+                  copy.setObjectName("Secondary")
+                  copy.setFixedWidth(90)
+                  copy.clicked.connect(lambda _c=False, e=edit, b=copy: self._copy(e.text(), b))
+                  line.addWidget(edit, 1)
+                  line.addWidget(copy)
+                  layout.addLayout(line)
+                  return edit
+
+              def _copy(self, text, button):
+                  QApplication.clipboard().setText(text)
+                  button.setText("Copied")
+
+              def find_model(self):
+                  key = ui.load_api_key()
+                  if not key:
+                      self.note.setText("Add your Gemini API key first.")
+                      return
+                  self.refresh_btn.setEnabled(False)
+                  self.note.setText("Asking Google which models your key can use...")
+                  self._worker = ui.FuncWorker(ui.discover_models, key)
+                  self._worker.done.connect(self._found)
+                  self._worker.start()
+
+              def _found(self, result):
+                  self.refresh_btn.setEnabled(True)
+                  if isinstance(result, Exception) or not result:
+                      self.note.setText("Could not read the model list. Keeping " + self.model_edit.text() + ".")
+                      return
+                  self.model_edit.setText(result[0])
+                  self.note.setText("Newest model for your key: " + result[0] + ".  Paste it into Newelle's Model field.")
+
+
+          # (Windows app, OneOS equivalent, command that proves it is installed)
+          WINDOWS_MAP = [
+              ("Notepad", "KWrite", "kwrite"),
+              ("Paint", "KolourPaint", "kolourpaint"),
+              ("Calculator", "KCalc", "kcalc"),
+              ("Snipping Tool", "Spectacle", "spectacle"),
+              ("Photos", "Gwenview", "gwenview"),
+              ("Media Player / Movies & TV", "VLC", "vlc"),
+              ("Groove Music", "Elisa", "elisa"),
+              ("Clipchamp", "Kdenlive", "kdenlive"),
+              ("Camera", "Kamoso", "kamoso"),
+              ("File Explorer", "Dolphin", "dolphin"),
+              ("Task Manager", "System Monitor", "plasma-systemmonitor"),
+              ("Settings", "System Settings", "systemsettings"),
+              ("System info / Device Manager", "Info Center", "kinfocenter"),
+              ("Event Viewer", "KSystemLog", "ksystemlog"),
+              ("Disk Management", "Partition Manager", "partitionmanager"),
+              ("Storage Sense", "Filelight", "filelight"),
+              ("Microsoft Edge", "Brave / Firefox", "brave-browser"),
+              ("Terminal / PowerShell", "Konsole", "konsole"),
+              ("Alarms & Clock", "KClock", "kclock"),
+              ("Calendar", "KOrganizer", "korganizer"),
+              ("Mail", "KMail", "kmail"),
+              ("People", "KAddressBook", "kaddressbook"),
+              ("Sticky Notes", "KNotes", "knotes"),
+              ("Word / Excel / PowerPoint", "LibreOffice", "libreoffice"),
+              ("PDF reader", "Okular", "okular"),
+              ("Zip / 7-Zip / WinRAR", "Ark", "ark"),
+              ("Phone Link", "KDE Connect", "kdeconnect-app"),
+              ("Microsoft Store", "Discover", "plasma-discover"),
+              ("Character Map", "KCharSelect", "kcharselect"),
+              ("Magnifier", "KMag", "kmag"),
+              ("Remote Desktop", "KRDC", "krdc"),
+              ("Maps", "Marble", "marble"),
+              ("Scan", "Skanpage", "skanpage"),
+              ("Printers & scanners", "Printer settings", "system-config-printer"),
+              ("Windows Firewall", "ufw / Firewall", "ufw"),
+              ("Run .exe programs", "Wine", "wine"),
+              ("Games (Xbox / PC)", "Lutris", "lutris"),
+          ]
+
+
+          class WindowsMapDialog(QDialog):
+              def __init__(self, parent):
+                  super().__init__(parent)
+                  self.setObjectName("Root")
+                  self.setStyleSheet(STYLE)
+                  self.setWindowTitle("Windows apps and their OneOS equivalents")
+                  self.setFixedSize(640, 640)
+                  layout = QVBoxLayout(self)
+                  layout.setContentsMargins(24, 20, 24, 18)
+                  layout.setSpacing(10)
+                  title = QLabel("Windows apps on OneOS")
+                  title.setObjectName("H2")
+                  layout.addWidget(title)
+
+                  rows = []
+                  missing = 0
+                  for windows_name, oneos_name, command in WINDOWS_MAP:
+                      present = shutil.which(command) is not None
+                      if not present:
+                          missing += 1
+                      mark = "✓" if present else "○"
+                      color = "#4ADE80" if present else "#FBBF24"
+                      rows.append(
+                          "<tr><td style='color:%s;padding:3px 10px 3px 0'>%s</td>"
+                          "<td style='padding:3px 14px 3px 0'>%s</td>"
+                          "<td style='color:#9AA6C8;padding:3px 0'>%s</td></tr>" % (color, mark, windows_name, oneos_name)
+                      )
+                  body = QLabel("<table>%s</table>" % "".join(rows))
+                  body.setTextFormat(Qt.TextFormat.RichText)
+                  body.setWordWrap(True)
+                  scroll = QScrollArea()
+                  scroll.setWidgetResizable(True)
+                  scroll.setFrameShape(QFrame.Shape.NoFrame)
+                  scroll.setWidget(body)
+                  layout.addWidget(scroll, 1)
+
+                  foot = QLabel(
+                      "✓ installed    ○ not installed on this copy of OneOS (Software Center can add it)."
+                      if missing else "✓ Everything in this list is installed."
+                  )
+                  foot.setObjectName("Muted")
+                  foot.setWordWrap(True)
+                  layout.addWidget(foot)
+                  row = QHBoxLayout()
+                  store = QPushButton("Open Software Center")
+                  store.setObjectName("Secondary")
+                  store.clicked.connect(lambda: launch(["plasma-discover"]))
+                  close = QPushButton("Close")
+                  close.setObjectName("Primary")
+                  close.clicked.connect(self.accept)
+                  row.addWidget(store)
+                  row.addStretch()
+                  row.addWidget(close)
+                  layout.addLayout(row)
 
 
           class Welcome(QWidget):
@@ -2195,7 +2503,8 @@ jobs:
                   nnote = QLabel(
                       "When you press Finish, OneOS downloads and sets up Newelle for you (needs internet). "
                       "It supports chats, documents, voice and terminal commands, and works with Gemini, "
-                      "OpenAI, Ollama and more. Add your key in Newelle's own setup. "
+                      "OpenAI, Ollama and more. For the newest Gemini models, use the Gemini in Newelle "
+                      "guide in the Welcome hub. "
                       "Quick window: Ctrl+Alt+N."
                   )
                   nnote.setObjectName("Muted")
@@ -2258,6 +2567,10 @@ jobs:
                       self.tile_install.clicked.connect(lambda: self.open_tool(["plasma-discover"]))
                   self.tile_wine = Tile("\U0001F377", "Windows apps", "Run .exe files with Wine")
                   self.tile_wine.clicked.connect(self.show_wine_guide)
+                  self.tile_newelle_gemini = Tile("\U0001F9E0", "Gemini in Newelle", "Newest Gemini models in Newelle")
+                  self.tile_newelle_gemini.clicked.connect(self.show_newelle_gemini)
+                  self.tile_appmap = Tile("\U0001F5C2\ufe0f", "Windows app finder", "OneOS version of each Windows app")
+                  self.tile_appmap.clicked.connect(self.show_windows_map)
                   self.tile_info = Tile("\U0001F4BB", "System info", "Show hardware and OS details")
                   self.tile_info.clicked.connect(lambda: self.open_tool(["konsole", "--hold", "-e", "fastfetch"]))
                   self.tile_settings = Tile("\u2699\ufe0f", "System Settings", "Wi-Fi, display, sound and more")
@@ -2272,7 +2585,8 @@ jobs:
                       self.tile_appearance, self.tile_assistant,
                       self.tile_circle, self.tile_newelle,
                       self.tile_key, self.tile_install,
-                      self.tile_wine, self.tile_info,
+                      self.tile_wine, self.tile_appmap,
+                      self.tile_newelle_gemini, self.tile_info,
                       self.tile_settings, self.tile_update,
                   ]
                   for index, tile in enumerate(tiles):
@@ -2346,15 +2660,20 @@ jobs:
                       self.set_status(cmd[0].rsplit("/", 1)[-1] + " is not available.")
 
               def install(self):
-                  cmd = ["sudo", "-E", "env",
-                         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                         "calamares"]
-                  if not shutil.which("sudo") and shutil.which("install-debian"):
+                  if shutil.which("install-debian"):
                       cmd = ["install-debian"]
+                  else:
+                      cmd = ["sudo", "-E", "calamares"]
                   if launch(cmd):
                       self.set_status("Starting the installer...")
                   else:
                       self.set_status("Could not start the installer.")
+
+              def show_newelle_gemini(self):
+                  NewelleGeminiDialog(self).exec()
+
+              def show_windows_map(self):
+                  WindowsMapDialog(self).exec()
 
               def show_wine_guide(self):
                   QMessageBox.information(
@@ -2620,6 +2939,54 @@ jobs:
                [(130, 90, 150, (96, 70, 200)), (520, 280, 170, (30, 150, 210)), (330, 330, 120, (120, 60, 170))])
           WALLPAPER_PY
 
+          # ---- Everyday apps (what a Windows user expects to find) ------------------------
+          # Installed one by one: a name that does not exist in Trixie only prints a warning.
+          echo "[OneOS] Installing everyday desktop apps..."
+          try_install \
+            kwrite kcalc kolourpaint kcharselect kclock knotes kfind kmag \
+            korganizer kmail kaddressbook \
+            elisa kdenlive kamoso marble \
+            filelight kinfocenter ksystemlog partitionmanager smartmontools plasma-disks \
+            krdc krfb kdeconnect plasma-browser-integration kio-gdrive \
+            khelpcenter kwalletmanager sweeper kup-backup \
+            skanpage sane-utils cups system-config-printer print-manager \
+            ufw plasma-firewall \
+            kdenetwork-filesharing cifs-utils smbclient
+
+          # Office suite (Word / Excel / PowerPoint replacement)
+          try_install libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
+            libreoffice-qt6 libreoffice-l10n-en-us libreoffice-help-en-us
+
+          # Fonts that make Word and Excel documents look right
+          try_install fonts-liberation2 fonts-crosextra-carlito fonts-crosextra-caladea fonts-dejavu-core fonts-noto-cjk
+
+          # Archives, USB sticks and codecs (7-Zip/WinRAR, exFAT, MP3/MP4/H.264)
+          try_install p7zip-full unar zip exfatprogs \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            libavcodec-extra kimageformat-plugins qt6-image-formats-plugins
+
+          # Report which Windows-equivalent apps ended up in the image (shown in Welcome)
+          mkdir -p /usr/share/oneos
+          : > /usr/share/oneos/app-check.txt
+          for entry in \
+            "Notepad:kwrite" "Paint:kolourpaint" "Calculator:kcalc" "Snipping Tool:spectacle" "Photos:gwenview" \
+            "Media Player:vlc" "Groove Music:elisa" "Clipchamp:kdenlive" "Camera:kamoso" "File Explorer:dolphin" \
+            "Task Manager:plasma-systemmonitor" "Settings:systemsettings" "System info:kinfocenter" \
+            "Event Viewer:ksystemlog" "Disk Management:partitionmanager" "Storage Sense:filelight" \
+            "Edge:brave-browser" "Terminal:konsole" "Clock:kclock" "Calendar:korganizer" "Mail:kmail" \
+            "People:kaddressbook" "Sticky Notes:knotes" "Office:libreoffice" "PDF:okular" "Zip:ark" \
+            "Phone Link:kdeconnect-app" "Store:plasma-discover" "Character Map:kcharselect" "Magnifier:kmag" \
+            "Remote Desktop:krdc" "Maps:marble" "Scan:skanpage" "Printers:system-config-printer" \
+            "Firewall:ufw" "Games:lutris" "Wine:wine"; do
+            name="${entry%%:*}"; cmd="${entry#*:}"
+            if command -v "${cmd}" >/dev/null 2>&1; then
+              echo "ok       ${name} -> ${cmd}" | tee -a /usr/share/oneos/app-check.txt
+            else
+              echo "MISSING  ${name} -> ${cmd}" | tee -a /usr/share/oneos/app-check.txt
+            fi
+          done
+          echo "[OneOS] App check: $(grep -c '^ok' /usr/share/oneos/app-check.txt) present, $(grep -c '^MISSING' /usr/share/oneos/app-check.txt) missing"
+
           # Remove XFCE completely
           apt-get purge -y \
             task-xfce-desktop \
@@ -2647,17 +3014,6 @@ jobs:
           # the network, which works because the apt package lists are kept in the image.
           try_install grub-pc
           mkdir -p /boot/grub
-
-          # ---- Calamares prerequisites: unsquashfs must exist and must survive autoremove -----
-          try_install squashfs-tools rsync
-          apt-mark manual squashfs-tools rsync calamares calamares-settings-debian grub-pc >/dev/null 2>&1 || true
-          UNSQ="$(command -v unsquashfs || true)"
-          if [ -z "${UNSQ}" ]; then
-            echo "[OneOS] ERROR: unsquashfs is missing from the image; the installer would fail"
-            exit 1
-          fi
-          ln -sf "${UNSQ}" /usr/local/bin/unsquashfs
-          echo "[OneOS] unsquashfs OK at ${UNSQ}"
 
           update-initramfs -u -k all || true
 
@@ -2732,46 +3088,6 @@ jobs:
             debian:trixie \
             /bin/bash /workspace/build-oneos.sh
 
-      - name: Audit finished ISO for Calamares installer prerequisites
-        run: |
-          set -uo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends squashfs-tools xorriso >/dev/null
-          ISO="${GITHUB_WORKSPACE}/OneOS-v${ONEOS_VERSION}.iso"
-          mkdir -p /tmp/audit
-          xorriso -osirrox on -indev "${ISO}" -extract /live/filesystem.squashfs /tmp/audit/fs.squashfs >/dev/null 2>&1
-          test -s /tmp/audit/fs.squashfs || { echo "ERROR: live/filesystem.squashfs missing from the ISO"; exit 1; }
-          ls -lh /tmp/audit/fs.squashfs
-          unsquashfs -ll /tmp/audit/fs.squashfs > /tmp/audit/list.txt
-          FAIL=0
-          for f in usr/bin/unsquashfs usr/bin/rsync usr/sbin/grub-install usr/bin/calamares \
-                   etc/calamares/modules/unpackfs.conf etc/calamares/settings.conf \
-                   etc/oneos-release usr/local/lib/oneos/live-autologin.sh \
-                   etc/systemd/system/oneos-live-autologin.service \
-                   etc/default/grub usr/sbin/grub-mkconfig; do
-            if grep -qE " squashfs-root/${f}( ->.*)?$" /tmp/audit/list.txt; then
-              echo "OK       ${f}"
-            else
-              echo "MISSING  ${f}"; FAIL=1
-            fi
-          done
-          if grep -qE " squashfs-root/var/lib/apt/lists/.*_Packages" /tmp/audit/list.txt; then
-            echo "OK       apt package lists present (Calamares can install grub-pc / grub-efi-amd64)"
-          else
-            echo "MISSING  apt package lists in /var/lib/apt/lists"; FAIL=1
-          fi
-          grep -qE " squashfs-root/boot/grub( |$)" /tmp/audit/list.txt && echo "OK       boot/grub" || { echo "MISSING  boot/grub"; FAIL=1; }
-          echo "---- /etc/calamares/modules/unpackfs.conf inside the image ----"
-          unsquashfs -cat /tmp/audit/fs.squashfs etc/calamares/modules/unpackfs.conf 2>&1 | head -30
-          echo "---- squashfs-tools / calamares versions inside the image ----"
-          unsquashfs -cat /tmp/audit/fs.squashfs var/lib/dpkg/status 2>/dev/null \
-            | awk '/^Package: (squashfs-tools|calamares|calamares-settings-debian|rsync|grub-pc)$/{p=1} p&&/^(Package|Status|Version):/{print} /^$/{p=0}'
-          if [ "${FAIL}" -ne 0 ]; then
-            echo "ERROR: the ISO is missing files the installer needs; not publishing it"
-            exit 1
-          fi
-          echo "Installer prerequisites are present in the ISO."
-
       - name: Boot-test the ISO in QEMU (diagnostics, never blocks the release)
         continue-on-error: true
         timeout-minutes: 20
@@ -2844,6 +3160,9 @@ jobs:
             - **First-boot wizard:** a guided setup for your look, your Gemini key and your shortcuts, with a one-click **Install to disk** option in the live session.
             - **Newelle AI, installed for you:** when the wizard finishes, OneOS downloads **Newelle** from Flathub, applies sensible permissions (host command access, home folder) and Konsole as its terminal, then starts it so Newelle's own first-run setup guides you. Open the quick window any time with `Ctrl + Alt + N`. If you were offline or skipped, OneOS offers to set it up again at your next login.
             - **OneOS Welcome hub:** one window for appearance, AI, software, updates, Wine and system tools. Optional at login.
+            - **Always-current Gemini:** the Assistant and Circle to Search use `gemini-3.8-flash` by default, ask Google which models your key can use, switch automatically if a model is retired and remember the one that works. You never need to edit `gemini.env`.
+            - **Gemini in Newelle:** Welcome has a *Gemini in Newelle* guide with copy buttons for the endpoint, model and key to paste into Newelle's OpenAI API provider (Newelle's built-in Gemini list is outdated).
+            - **Windows app finder:** Welcome shows the OneOS equivalent of each default Windows app and whether it is installed. More everyday apps are included (LibreOffice, KClock, KolourPaint, KCalc, KDE Connect, Kdenlive and more).
             - **OneOS Assistant (`Super + Space`):** a Spotlight-style Gemini chat with conversation history, Markdown answers, copy buttons, clipboard quick actions and friendly error messages.
             - **Circle to Search (`Super + Shift + C`):** draw freely around anything on screen, then ask Gemini about it.
             - **Two visual profiles:** ✨ Liquid Glass (KWin blur, translucent apps, aurora wallpaper) and ⚡ Sleek Obsidian (matte, zero GPU overhead), switchable live without logging out.
