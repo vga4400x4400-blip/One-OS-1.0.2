@@ -198,6 +198,13 @@ jobs:
           vm.page-cluster=0
           SYSCTL_EOF
 
+          # Disable the KDE Wallet so Brave, Wi-Fi and other apps stop asking to unlock it (GPG/wallet popups).
+          # Apps then fall back to their own profile storage.
+          cat <<'KWALLET_EOF' > config/includes.chroot/etc/xdg/kwalletrc
+          [Wallet]
+          Enabled=false
+          KWALLET_EOF
+
           # Disable KDE Baloo background file indexing by default
           cat <<'BALOO_EOF' > config/includes.chroot/etc/xdg/baloofilerc
           [Basic Settings]
@@ -2898,9 +2905,16 @@ jobs:
           fi
           command -v kwriteconfig6 >/dev/null 2>&1 || echo "[OneOS] WARNING: kwriteconfig6 is missing; visual profiles will not apply"
 
-          # Flathub (system-wide) for the Software Center. Newelle itself is installed per-user
-          # after the first-boot wizard, so it is not baked into the ISO (keeps the ISO small).
+          # Flathub (system-wide) for the Software Center. Newelle is preinstalled below.
           flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
+
+          # Newelle is built into the image (latest Flathub version at build time), so it starts
+          # straight away. If this step fails the first-run installer in oneos-newelle-setup still works.
+          if flatpak install --system -y --noninteractive flathub io.github.qwersyk.Newelle; then
+            echo "[OneOS] Newelle preinstalled: $(flatpak info --system io.github.qwersyk.Newelle | grep -i -m1 'version' || echo unknown)"
+          else
+            echo "[OneOS] WARNING: could not preinstall Newelle; it will install on first launch."
+          fi
 
           # Brave Browser
           install -m 0755 -d /usr/share/keyrings
@@ -2911,6 +2925,28 @@ jobs:
             > /etc/apt/sources.list.d/brave-browser-release.list
           apt-get update
           apt-get install "${APT_OPTS[@]}" --no-install-recommends brave-browser
+
+          # Brave must never ask for the KDE Wallet / GPG: use its own password store.
+          if [ -x /usr/bin/brave-browser-stable ]; then
+            cat > /usr/local/bin/brave-browser <<'BRAVEWRAP_EOF'
+          #!/bin/sh
+          exec /usr/bin/brave-browser-stable --password-store=basic "$@"
+          BRAVEWRAP_EOF
+            chmod 0755 /usr/local/bin/brave-browser
+            for d in brave-browser.desktop com.brave.Browser.desktop; do
+              if [ -f "/usr/share/applications/${d}" ]; then
+                mkdir -p /usr/local/share/applications
+                sed -E 's#^(Exec=[^ ]+)#\1 --password-store=basic#' "/usr/share/applications/${d}" \
+                  > "/usr/local/share/applications/${d}"
+              fi
+            done
+          fi
+
+          # Keep the KDE Wallet service from ever starting (nothing prompts, nothing needs unlocking).
+          mkdir -p /usr/local/share/dbus-1/services
+          for n in org.kde.kwalletd6 org.kde.kwalletd5; do
+            printf '[D-BUS Service]\nName=%s\nExec=/bin/false\n' "$n" > "/usr/local/share/dbus-1/services/${n}.service"
+          done
 
           # Wallpapers for both visual profiles (generated, no extra download)
           mkdir -p /usr/share/backgrounds/oneos
@@ -2948,7 +2984,7 @@ jobs:
             elisa kdenlive kamoso marble \
             filelight kinfocenter ksystemlog partitionmanager smartmontools plasma-disks \
             krdc krfb kdeconnect plasma-browser-integration kio-gdrive \
-            khelpcenter kwalletmanager sweeper kup-backup \
+            khelpcenter sweeper kup-backup \
             skanpage sane-utils cups system-config-printer print-manager \
             ufw plasma-firewall \
             kdenetwork-filesharing cifs-utils smbclient
