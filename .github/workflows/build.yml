@@ -544,6 +544,7 @@ jobs:
           plasma-pa
           plasma-systemmonitor
           plasma-discover
+          plasma-discover-backend-flatpak
           powerdevil
           kscreen
           bluedevil
@@ -2896,6 +2897,7 @@ jobs:
           apt-get install "${APT_OPTS[@]}" --no-install-recommends libwine libwine:i386 || true
           apt-get install "${APT_OPTS[@]}" --no-install-recommends virtualbox-guest-x11 virtualbox-guest-utils || true
           apt-get install "${APT_OPTS[@]}" --no-install-recommends plasma-discover-backend-flatpak || true
+          dpkg -s plasma-discover-backend-flatpak >/dev/null 2>&1 || echo "[OneOS] WARNING: Discover Flatpak plugin missing"
 
           # kwriteconfig is required by oneos-apply-visual-mode
           if ! command -v kwriteconfig6 >/dev/null 2>&1; then
@@ -2915,6 +2917,26 @@ jobs:
           else
             echo "[OneOS] WARNING: could not preinstall Newelle; it will install on first launch."
           fi
+
+          # Flatseal: graphical manager for Flatpak app permissions (shows up when you search "flatpak")
+          flatpak install --system -y --noninteractive flathub com.github.tchx84.Flatseal \
+            || echo "[OneOS] WARNING: could not preinstall Flatseal."
+
+          # oneos-flatpak-install: install from Flathub without the "system or user?" question
+          cat > /usr/local/bin/oneos-flatpak-install <<'FPINSTALL_EOF'
+          #!/bin/sh
+          # Usage: oneos-flatpak-install <app-id> [<app-id> ...]
+          #   e.g. oneos-flatpak-install io.github.qwersyk.Newelle
+          if [ "$#" -lt 1 ]; then
+            echo "Usage: oneos-flatpak-install <app-id> [<app-id> ...]"
+            echo "Example: oneos-flatpak-install io.github.qwersyk.Newelle"
+            exit 1
+          fi
+          if [ "$(id -u)" -eq 0 ]; then scope="--system"; else scope="--user"; fi
+          flatpak remote-add "$scope" --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1 || true
+          exec flatpak install "$scope" -y --noninteractive flathub "$@"
+          FPINSTALL_EOF
+          chmod 0755 /usr/local/bin/oneos-flatpak-install
 
           # Brave Browser
           install -m 0755 -d /usr/share/keyrings
