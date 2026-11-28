@@ -579,6 +579,9 @@ jobs:
           xserver-xorg
           x11-xserver-utils
           x11-utils
+          pulseaudio-utils
+          alsa-utils
+          espeak-ng
           xdg-utils
           xdg-user-dirs
           xdg-desktop-portal-kde
@@ -649,11 +652,17 @@ jobs:
           # ------------------------------------------------------------------
           cat <<'UI_PY_EOF' > config/includes.chroot/usr/local/lib/oneos/oneos_ui.py
           #!/usr/bin/env python3
-          """Shared helpers for the OneOS desktop tools (Welcome, Assistant, Circle to Search)."""
+          """Shared helpers for the OneOS desktop tools (Welcome, Assistant, Circle to Search, Gemini Live)."""
+          import array
           import math
           import os
+          import re
           import shutil
+          import signal
           import subprocess
+          import tempfile
+          import time
+          import wave
           from pathlib import Path
 
           import requests
@@ -663,14 +672,31 @@ jobs:
           GEMINI_ENV = CONF_DIR / "gemini.env"
           VISUAL_MODE_FILE = CONF_DIR / "visual_mode"
           FIRST_BOOT_FLAG = CONF_DIR / "first_boot_done"
-          NEWELLE_FLAG = CONF_DIR / "newelle_installed"
           STARTUP_FLAG = CONF_DIR / "welcome_startup"
           RELEASE_FILE = Path("/etc/oneos-release")
           APPLY_VISUAL_MODE = "/usr/local/bin/oneos-apply-visual-mode"
-          NEWELLE_SETUP = "/usr/local/bin/oneos-newelle-setup"
 
           API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-          DEFAULT_MODEL = "gemini-2.5-flash"
+          DEFAULT_MODEL = "gemini-3.8-flash"
+          # Ranking only, never a gate: the real list is asked from Google for the user's own key.
+          # Source: https://ai.google.dev/gemini-api/docs/models  (2.0 models are shut down, 2.5 is legacy)
+          MODEL_PREFERENCE = (
+              "gemini-3.8-flash",
+              "gemini-3.6-flash",
+              "gemini-3.5-flash",
+              "gemini-3.5-flash-lite",
+              "gemini-3.1-flash-lite",
+              "gemini-3-flash-preview",
+              "gemini-flash-latest",
+              "gemini-2.5-flash",
+          )
+          NON_CHAT_WORDS = (
+              "tts", "live", "image", "embedding", "audio", "transcribe", "robotics", "computer-use",
+              "lyria", "omni", "imagen", "veo", "deep-research", "aqa", "learnlm", "nano-banana",
+          )
+          MODEL_RECHECK_SECONDS = 24 * 3600
+          TTS_MODEL = "gemini-3.8-flash-tts"  # natural voice; espeak-ng is the offline fallback
+          TTS_VOICE = "Kore"
           KEY_URL = "https://aistudio.google.com/apikey"
           SYSTEM_PROMPT = (
               "You are OneOS Assistant, built into a Debian KDE Plasma desktop. "
@@ -680,7 +706,9 @@ jobs:
 
 
           class GeminiError(Exception):
-              pass
+              def __init__(self, message, code=None):
+                  super().__init__(message)
+                  self.code = code
 
 
           # ----------------------------------------------------------------- config
@@ -728,8 +756,14 @@ jobs:
               write_env_file(data)
 
 
+          def explicit_model():
+              """A model the user chose by hand (environment or gemini.env), or ''."""
+              return os.environ.get("GEMINI_MODEL", "").strip() or read_env_file().get("GEMINI_MODEL", "").strip()
+
+
           def load_model():
-              return os.environ.get("GEMINI_MODEL", "").strip() or read_env_file().get("GEMINI_MODEL") or DEFAULT_MODEL
+              """Cheap offline label for the model in use: the user's choice, the last auto-picked one, or the default."""
+              return explicit_model() or read_env_file().get("GEMINI_MODEL_AUTO", "") or DEFAULT_MODEL
 
 
           def current_visual_mode():
@@ -758,10 +792,6 @@ jobs:
                   return subprocess.run(["systemd-detect-virt", "--quiet"], check=False).returncode == 0
               except OSError:
                   return False
-
-
-          def newelle_installed():
-              return NEWELLE_FLAG.exists()
 
 
           def startup_enabled():
@@ -839,43 +869,147 @@ jobs:
               if code in (401, 403):
                   return "Gemini refused this API key (permission denied). Check the key in OneOS Welcome."
               if code == 404:
-                  return "That Gemini model was not found. Set GEMINI_MODEL in ~/.config/oneos/gemini.env."
+                  return "That Gemini model is not available for this key. OneOS picks a working one automatically - please try again."
               if code == 429:
                   return "Gemini rate limit or free quota reached. Wait a minute and try again."
               if code >= 500:
-                  return "The Gemini service is busy right now. Please try again shortly."
+                  return "Gemini is overloaded right now. Please try again in a minute."
               return "Gemini error " + str(code) + ((": " + message) if message else ".")
 
 
-          def gemini_generate(contents, api_key, model=None):
-              url = API_BASE + "/models/" + (model or load_model()) + ":generateContent"
+          def list_models(api_key):
+              """Gemini chat models this key can call, straight from Google (handles paging)."""
+              names, token = [], ""
+              for _ in range(10):
+                  url = API_BASE + "/models?pageSize=100" + (("&pageToken=" + token) if token else "")
+                  try:
+                      resp = requests.get(url, headers=_headers(api_key), timeout=20)
+                  except requests.exceptions.RequestException as exc:
+                      raise GeminiError(_network_message(exc))
+                  if resp.status_code != 200:
+                      raise GeminiError(_explain_http_error(resp), resp.status_code)
+                  data = resp.json()
+                  for item in data.get("models", []):
+                      name = item.get("name", "").split("/")[-1]
+                      methods = item.get("supportedGenerationMethods") or []
+                      if name.startswith("gemini") and "generateContent" in methods and not any(w in name for w in NON_CHAT_WORDS):
+                          names.append(name)
+                  token = data.get("nextPageToken", "")
+                  if not token:
+                      break
+              return names
+
+
+          def pick_model(available):
+              for name in MODEL_PREFERENCE:
+                  if name in available:
+                      return name
+              flash = sorted((m for m in available if "flash" in m and "lite" not in m), reverse=True)
+              if flash:
+                  return flash[0]
+              return sorted(available)[-1] if available else None
+
+
+          def resolve_model(api_key, force=False, avoid=None):
+              """The model to use: the user's own choice if it works, else the best one Google offers this key.
+              The pick is remembered (GEMINI_MODEL_AUTO) and re-checked daily, or at once when a call says 'not found'."""
+              by_user = explicit_model()
+              env = read_env_file()
+              auto = env.get("GEMINI_MODEL_AUTO", "")
+              try:
+                  checked = float(env.get("GEMINI_MODEL_CHECKED", "0"))
+              except ValueError:
+                  checked = 0.0
+              fresh = (time.time() - checked) < MODEL_RECHECK_SECONDS
+              if not force and not by_user and auto and fresh and auto != avoid:
+                  return auto
+              try:
+                  available = [m for m in list_models(api_key) if m != avoid]
+              except GeminiError:
+                  return by_user or auto or DEFAULT_MODEL  # offline: keep whatever worked last
+              if by_user and by_user in available:
+                  return by_user
+              pick = pick_model(available) or DEFAULT_MODEL
+              env["GEMINI_MODEL_AUTO"] = pick
+              env["GEMINI_MODEL_CHECKED"] = str(int(time.time()))
+              try:
+                  write_env_file(env)
+              except OSError:
+                  pass
+              return pick
+
+
+          def _generate(contents, api_key, model, system_prompt):
+              url = API_BASE + "/models/" + model + ":generateContent"
               payload = {
                   "contents": contents,
-                  "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                  "systemInstruction": {"parts": [{"text": system_prompt or SYSTEM_PROMPT}]},
               }
               try:
-                  resp = requests.post(url, headers=_headers(api_key), json=payload, timeout=60)
+                  resp = requests.post(url, headers=_headers(api_key), json=payload, timeout=90)
               except requests.exceptions.RequestException as exc:
                   raise GeminiError(_network_message(exc))
               if resp.status_code != 200:
-                  raise GeminiError(_explain_http_error(resp))
+                  raise GeminiError(_explain_http_error(resp), resp.status_code)
               data = resp.json()
               candidates = data.get("candidates") or []
               if not candidates:
                   reason = (data.get("promptFeedback") or {}).get("blockReason")
                   raise GeminiError("Gemini returned no answer" + ((" (" + reason + ")") if reason else "") + ".")
               parts = (candidates[0].get("content") or {}).get("parts") or []
-              text = "\n".join(p.get("text", "") for p in parts if "text" in p).strip()
+              text = "\n".join(p.get("text", "") for p in parts if "text" in p and not p.get("thought")).strip()
               return text or "_Gemini returned an empty response._"
 
 
-          def test_api_key(api_key):
+          RETRYABLE = (404, 429, 500, 502, 503, 504)
+
+
+          def _next_model(api_key, avoid, not_found):
+              """Another model for this key (a 404 also refreshes the remembered pick), or None."""
+              if not_found:
+                  pick = resolve_model(api_key, force=True, avoid=next(iter(avoid)) if len(avoid) == 1 else None)
+                  if pick and pick not in avoid:
+                      return pick
               try:
-                  resp = requests.get(API_BASE + "/models?pageSize=1", headers=_headers(api_key), timeout=20)
-              except requests.exceptions.RequestException as exc:
-                  raise GeminiError(_network_message(exc))
-              if resp.status_code != 200:
-                  raise GeminiError(_explain_http_error(resp))
+                  available = [m for m in list_models(api_key) if m not in avoid]
+              except GeminiError:
+                  return None
+              return pick_model(available)
+
+
+          def gemini_generate(contents, api_key, model=None, system_prompt=None):
+              """Ask Gemini. If the model is retired (404), over quota (429) or overloaded (5xx), retry once and then
+              move on to the next-best model this key can use, so a busy model never ends the conversation."""
+              chosen = model or resolve_model(api_key)
+              avoid, retried, last = set(), False, None
+              for _ in range(5):
+                  try:
+                      return _generate(contents, api_key, chosen, system_prompt)
+                  except GeminiError as exc:
+                      last = exc
+                      if model or exc.code not in RETRYABLE:
+                          raise
+                      if exc.code in (500, 502, 503, 504) and not retried:
+                          retried = True
+                          time.sleep(1.5)
+                          continue
+                      avoid.add(chosen)
+                      retried = False
+                      nxt = _next_model(api_key, avoid, exc.code == 404)
+                      if not nxt:
+                          break
+                      chosen = nxt
+              if last is not None and last.code in (500, 502, 503, 504):
+                  raise GeminiError("Gemini is overloaded right now and every model I tried was busy. Please try again in a minute.", last.code)
+              raise last or GeminiError("No Gemini chat model is available for this key. Check the key in OneOS Welcome.", 404)
+
+
+          def test_api_key(api_key):
+              list_models(api_key)  # raises a friendly GeminiError for a bad key, no internet, and so on
+              try:
+                  resolve_model(api_key, force=True)  # warm the model choice so the first question is fast
+              except Exception:  # noqa: BLE001
+                  pass
               return True
 
 
@@ -896,6 +1030,277 @@ jobs:
                   except Exception as exc:  # noqa: BLE001
                       result = exc
                   self.done.emit(result)
+
+
+          # ----------------------------------------------------------------- voice
+          SAMPLE_RATE = 16000
+          CHUNK_SECONDS = 0.1
+          RECORD_COMMANDS = (
+              ["parecord", "--raw", "--format=s16le", "--rate=16000", "--channels=1", "--latency-msec=60"],
+              ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1"],
+          )
+          PLAY_COMMANDS = (
+              ["paplay"],
+              ["aplay", "-q"],
+              ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"],
+          )
+          SPEAK_COMMANDS = (
+              ["espeak-ng", "-s", "165", "-v", "en-us"],
+              ["spd-say", "--wait"],
+          )
+
+
+          def pcm_rms(chunk):
+              """Loudness of a block of 16-bit mono PCM (no audioop: it was removed in Python 3.13)."""
+              samples = array.array("h")
+              samples.frombytes(chunk[: len(chunk) // 2 * 2])
+              if not samples:
+                  return 0.0
+              return math.sqrt(sum(s * s for s in samples) / len(samples))
+
+
+          def write_wav(path, pcm, rate=SAMPLE_RATE):
+              with wave.open(str(path), "wb") as handle:
+                  handle.setnchannels(1)
+                  handle.setsampwidth(2)
+                  handle.setframerate(rate)
+                  handle.writeframes(pcm)
+
+
+          def tts_to_wav(text, api_key):
+              """Natural-sounding speech from Gemini. Returns a WAV path; raises GeminiError when unavailable."""
+              import base64
+
+              text = markdown_to_speech(text, 1200)
+              if not text:
+                  raise GeminiError("Nothing to read aloud.")
+              voice = read_env_file().get("GEMINI_VOICE", "") or os.environ.get("GEMINI_VOICE", "") or TTS_VOICE
+              payload = {
+                  "contents": [{"parts": [{"text": text}]}],
+                  "generationConfig": {
+                      "responseModalities": ["AUDIO"],
+                      "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
+                  },
+              }
+              try:
+                  resp = requests.post(API_BASE + "/models/" + TTS_MODEL + ":generateContent",
+                                       headers=_headers(api_key), json=payload, timeout=60)
+              except requests.exceptions.RequestException as exc:
+                  raise GeminiError(_network_message(exc))
+              if resp.status_code != 200:
+                  raise GeminiError(_explain_http_error(resp), resp.status_code)
+              for cand in resp.json().get("candidates") or []:
+                  for part in (cand.get("content") or {}).get("parts") or []:
+                      blob = part.get("inlineData") or part.get("inline_data")
+                      if blob and blob.get("data"):
+                          match = re.search(r"rate=(\d+)", blob.get("mimeType") or blob.get("mime_type") or "")
+                          rate = int(match.group(1)) if match else 24000
+                          fd, path = tempfile.mkstemp(prefix="oneos-tts-", suffix=".wav", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+                          os.close(fd)
+                          write_wav(path, base64.b64decode(blob["data"]), rate)
+                          return path
+              raise GeminiError("Gemini returned no audio.")
+
+
+          def record_command():
+              for cmd in RECORD_COMMANDS:
+                  if shutil.which(cmd[0]):
+                      return cmd
+              return None
+
+
+          def speak_command():
+              for cmd in SPEAK_COMMANDS:
+                  if shutil.which(cmd[0]):
+                      return cmd
+              return None
+
+
+          def play_command():
+              for cmd in PLAY_COMMANDS:
+                  if shutil.which(cmd[0]):
+                      return cmd
+              return None
+
+
+          def markdown_to_speech(text, limit=1400):
+              """Plain sentences for a text-to-speech engine: no code, links, bullets or emphasis marks."""
+              text = re.sub(r"```.*?```", " (a code example is shown on screen) ", text, flags=re.S)
+              text = re.sub(r"`([^`]*)`", r"\1", text)
+              text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+              text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
+              text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
+              text = re.sub(r"[*_~>|]", "", text)
+              text = re.sub(r"\s+", " ", text).strip()
+              return text[:limit]
+
+
+          class SpeechGate:
+              """Decides when a spoken sentence starts and ends, from 100 ms blocks of PCM. Pure logic, no audio I/O."""
+
+              def __init__(self, hands_free=True, wait_seconds=8.0, silence_seconds=1.2, max_seconds=45.0):
+                  self.hands_free = hands_free
+                  self.wait_seconds = wait_seconds
+                  self.silence_seconds = silence_seconds
+                  self.max_seconds = max_seconds
+                  self.elapsed = 0.0
+                  self.noise = []
+                  self.threshold = 450.0
+                  self.started = False
+                  self.quiet = 0.0
+                  self.speech_seconds = 0.0
+                  self.preroll = []
+                  self.pcm = bytearray()
+
+              def feed(self, chunk):
+                  """Returns True when the recording should end."""
+                  level = pcm_rms(chunk)
+                  self.elapsed += CHUNK_SECONDS
+                  if not self.started:
+                      if len(self.noise) < 4:  # first 0.4 s calibrates the room noise
+                          self.noise.append(level)
+                          self.threshold = max(450.0, 3.0 * (sum(self.noise) / len(self.noise)))
+                          self.preroll.append(chunk)
+                          return False
+                      if level > self.threshold:
+                          self.started = True
+                          self.pcm.extend(b"".join(self.preroll[-3:]))
+                          self.pcm.extend(chunk)
+                          self.speech_seconds += CHUNK_SECONDS
+                          return False
+                      self.preroll.append(chunk)
+                      self.preroll = self.preroll[-6:]
+                      return self.hands_free and self.elapsed >= self.wait_seconds
+                  self.pcm.extend(chunk)
+                  if level > self.threshold:
+                      self.quiet = 0.0
+                      self.speech_seconds += CHUNK_SECONDS
+                  else:
+                      self.quiet += CHUNK_SECONDS
+                  if self.hands_free and self.quiet >= self.silence_seconds:
+                      return True
+                  return self.elapsed >= self.max_seconds
+
+              def has_speech(self):
+                  return self.started and self.speech_seconds >= 0.3
+
+
+          class Recorder(QThread):
+              """Records the microphone until the speaker pauses (hands-free) or stop() is called."""
+
+              level = pyqtSignal(float)
+              finished_wav = pyqtSignal(str)  # path of the WAV, or "" when nothing was said
+
+              def __init__(self, hands_free=True):
+                  super().__init__()
+                  self.hands_free = hands_free
+                  self._stop = False
+                  self._proc = None
+
+              def stop(self):
+                  self._stop = True
+
+              def cancel(self):
+                  self._stop = True
+                  self._cancelled = True
+                  self._kill()
+
+              _cancelled = False
+
+              def _kill(self):
+                  proc = self._proc
+                  if proc is not None and proc.poll() is None:
+                      try:
+                          proc.terminate()
+                      except OSError:
+                          pass
+
+              def run(self):
+                  cmd = record_command()
+                  if cmd is None:
+                      self.finished_wav.emit("")
+                      return
+                  gate = SpeechGate(hands_free=self.hands_free)
+                  try:
+                      self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                      block = int(SAMPLE_RATE * 2 * CHUNK_SECONDS)
+                      while not self._stop:
+                          chunk = self._proc.stdout.read(block)
+                          if not chunk:
+                              break
+                          self.level.emit(pcm_rms(chunk))
+                          if gate.feed(chunk):
+                              break
+                  except OSError:
+                      pass
+                  finally:
+                      self._kill()
+                  if self._cancelled or not gate.has_speech():
+                      self.finished_wav.emit("")
+                      return
+                  fd, path = tempfile.mkstemp(prefix="oneos-voice-", suffix=".wav", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+                  os.close(fd)
+                  write_wav(path, bytes(gate.pcm))
+                  self.finished_wav.emit(path)
+
+
+          class Speaker:
+              """Plays speech: a Gemini voice WAV when we have one, otherwise espeak-ng (offline)."""
+
+              def __init__(self):
+                  self.proc = None
+                  self.wav = None
+
+              def play(self, wav_path):
+                  self.stop()
+                  cmd = play_command()
+                  if cmd is None:
+                      self._drop(wav_path)
+                      return False
+                  try:
+                      self.proc = subprocess.Popen(cmd + [wav_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      self.wav = wav_path
+                      return True
+                  except OSError:
+                      self._drop(wav_path)
+                      return False
+
+              @staticmethod
+              def _drop(path):
+                  try:
+                      os.remove(path)
+                  except (OSError, TypeError):
+                      pass
+
+              def say(self, text):
+                  self.stop()
+                  cmd = speak_command()
+                  text = markdown_to_speech(text)
+                  if cmd is None or not text:
+                      return False
+                  try:
+                      self.proc = subprocess.Popen(cmd + [text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      return True
+                  except OSError:
+                      return False
+
+              def speaking(self):
+                  busy = self.proc is not None and self.proc.poll() is None
+                  if not busy and self.wav:
+                      self._drop(self.wav)
+                      self.wav = None
+                  return busy
+
+              def stop(self):
+                  if self.proc is not None and self.proc.poll() is None:
+                      try:
+                          self.proc.terminate()
+                      except OSError:
+                          pass
+                  self.proc = None
+                  if self.wav:
+                      self._drop(self.wav)
+                      self.wav = None
           UI_PY_EOF
 
           # ------------------------------------------------------------------
@@ -917,7 +1322,7 @@ jobs:
           import oneos_ui as ui  # noqa: E402
 
           from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QTimer  # noqa: E402
-          from PyQt6.QtGui import QClipboard, QColor, QGuiApplication, QImage, QKeySequence, QPixmap, QShortcut  # noqa: E402
+          from PyQt6.QtGui import QClipboard, QColor, QGuiApplication, QIcon, QImage, QKeySequence, QPixmap, QShortcut  # noqa: E402
           from PyQt6.QtWidgets import (  # noqa: E402
               QApplication,
               QFrame,
@@ -933,6 +1338,7 @@ jobs:
 
           PID_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "oneos-gemini-assistant.pid"
           CIRCLE_SEARCH = "/usr/local/bin/oneos-circle-search"
+          GEMINI_LIVE = "/usr/local/bin/oneos-gemini-live"
           WELCOME = "/usr/local/bin/oneos-welcome"
           MAX_BUBBLE_WIDTH = 500
           CARD_RADIUS = 28
@@ -1147,6 +1553,9 @@ jobs:
                   hl.addWidget(title)
                   hl.addWidget(chip)
                   hl.addStretch()
+                  live_btn = QPushButton("\U0001F399  Live")
+                  live_btn.setToolTip("Talk to Gemini about your screen (Super+Shift+L)")
+                  live_btn.clicked.connect(self.launch_live)
                   circle_btn = QPushButton("\u25ce  Circle to Search")
                   circle_btn.setToolTip("Draw around anything on screen (Super+Shift+C)")
                   circle_btn.clicked.connect(self.launch_circle_to_search)
@@ -1157,7 +1566,7 @@ jobs:
                   close_btn.setFixedWidth(34)
                   close_btn.setToolTip("Close (Esc)")
                   close_btn.clicked.connect(self.close)
-                  for btn in (circle_btn, new_btn, close_btn):
+                  for btn in (live_btn, circle_btn, new_btn, close_btn):
                       btn.setCursor(Qt.CursorShape.PointingHandCursor)
                       hl.addWidget(btn)
                   root.addWidget(header)
@@ -1426,6 +1835,11 @@ jobs:
                   QTimer.singleShot(80, self._apply_blur)
 
               # ------------------------------------------------------------ actions
+              def launch_live(self):
+                  self.hide()
+                  subprocess.Popen([GEMINI_LIVE], start_new_session=True)
+                  QTimer.singleShot(150, QApplication.instance().quit)
+
               def launch_circle_to_search(self):
                   self.hide()
                   subprocess.Popen([CIRCLE_SEARCH], start_new_session=True)
@@ -1445,6 +1859,7 @@ jobs:
               app = QApplication(sys.argv)
               app.setApplicationName("OneOS Assistant")
               app.setDesktopFileName("oneos-gemini-assistant")
+              app.setWindowIcon(QIcon.fromTheme("oneos-gemini"))
               signal.signal(signal.SIGTERM, lambda *_: app.quit())
               heartbeat = QTimer()
               heartbeat.timeout.connect(lambda: None)
@@ -1478,7 +1893,7 @@ jobs:
           from pathlib import Path
 
           from PyQt6.QtCore import QPointF, QRect, QRectF, Qt
-          from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
+          from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
           from PyQt6.QtWidgets import QApplication, QWidget
 
           ASSISTANT = "/usr/local/bin/oneos-gemini-assistant.py"
@@ -1628,6 +2043,7 @@ jobs:
           def main():
               app = QApplication(sys.argv)
               app.setApplicationName("OneOS Circle to Search")
+              app.setWindowIcon(QIcon.fromTheme("oneos-circle-search"))
               shot = capture_screen(app)
               if shot.isNull():
                   notify("Could not capture the screen. On Wayland, install or allow Spectacle.")
@@ -1644,181 +2060,6 @@ jobs:
           CTS_PY_EOF
 
           # ------------------------------------------------------------------
-          # Newelle: installs the Newelle AI assistant (Flathub) after the first-boot wizard,
-          # applies the permissions/terminal settings that make it useful, then starts it so
-          # Newelle's own first-run setup appears.
-          #   oneos-newelle-setup --install      install (if needed), configure, launch
-          #   oneos-newelle-setup --auto         login-time retry: asks once, skipped in live sessions
-          #   oneos-newelle-setup --launch-mini  open the Newelle quick window (installs first if missing)
-          # ------------------------------------------------------------------
-          cat <<'NEWELLE_SH_EOF' > config/includes.chroot/usr/local/bin/oneos-newelle-setup
-          #!/usr/bin/env bash
-          # OneOS: install and configure Newelle (https://github.com/qwersyk/Newelle) from Flathub.
-          set -uo pipefail
-
-          APP_ID="io.github.qwersyk.Newelle"
-          REMOTE_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
-          CONF_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/oneos"
-          LOG_DIR="${HOME}/.cache/oneos"
-          LOG_FILE="${LOG_DIR}/newelle-setup.log"
-          DONE_FLAG="${CONF_DIR}/newelle_installed"
-          MIN_LIVE_KB=4194304
-          MODE="${1:---install}"
-
-          mkdir -p "${CONF_DIR}" "${LOG_DIR}"
-
-          say()  { printf '\n\033[1;36m[Newelle]\033[0m %s\n' "$*"; }
-          warn() { printf '\n\033[1;33m[Newelle]\033[0m %s\n' "$*"; }
-
-          notify() {
-            if command -v notify-send >/dev/null 2>&1; then
-              notify-send -i "${3:-dialog-information}" "$1" "${2:-}" || true
-            fi
-          }
-
-          is_live() { grep -q 'boot=live' /proc/cmdline 2>/dev/null; }
-          is_installed() { flatpak info "${APP_ID}" >/dev/null 2>&1; }
-          have_network() { curl -fsS --max-time 8 -o /dev/null "${REMOTE_URL}" >/dev/null 2>&1; }
-          pause_close() { printf '\nPress Enter to close this window...'; read -r _ || true; }
-
-          # Show progress in a Konsole window when started from the desktop (no terminal attached)
-          relaunch_in_terminal() {
-            if [ -t 1 ] || [ "${ONEOS_IN_TERM:-0}" = "1" ]; then
-              return 0
-            fi
-            if command -v konsole >/dev/null 2>&1; then
-              ONEOS_IN_TERM=1 exec konsole --separate --hide-menubar -e "$0" "$@"
-            fi
-            return 0
-          }
-
-          launch_newelle() {
-            nohup flatpak run "${APP_ID}" "$@" >/dev/null 2>&1 &
-            disown || true
-          }
-
-          configure_newelle() {
-            say "Applying OneOS settings for Newelle..."
-            # Let Newelle run the commands it suggests on the real system (opt-in per command inside Newelle)
-            flatpak override --user \
-              --talk-name=org.freedesktop.Flatpak \
-              --filesystem=home \
-              "${APP_ID}" || true
-            # Use Konsole for terminal commands, and Plasma-friendly defaults
-            flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal-on true || true
-            flatpak run --command=gsettings "${APP_ID}" set io.github.qwersyk.Newelle external-terminal "'konsole -e bash -c {0}'" || true
-          }
-
-          install_newelle() {
-            if ! command -v flatpak >/dev/null 2>&1; then
-              warn "Flatpak is not installed on this system."
-              return 1
-            fi
-
-            if is_live; then
-              local avail_kb
-              avail_kb="$(df --output=avail -k "${HOME}" 2>/dev/null | tail -n 1 | tr -d ' ')"
-              if [ "${avail_kb:-0}" -lt "${MIN_LIVE_KB}" ]; then
-                warn "Not enough free space in the live session (Newelle needs about 4 GB)."
-                warn "It will be set up automatically after you install OneOS to disk."
-                notify "Newelle" "Not enough space in the live session. It will be set up after installing OneOS." dialog-information
-                return 2
-              fi
-            fi
-
-            say "Checking your internet connection..."
-            local tries=0
-            until have_network; do
-              tries=$((tries + 1))
-              if [ "${tries}" -ge 12 ]; then
-                warn "No internet connection. Connect to Wi-Fi or Ethernet, then try again from OneOS Welcome."
-                return 1
-              fi
-              sleep 5
-            done
-
-            say "Adding the Flathub app store..."
-            flatpak remote-add --user --if-not-exists flathub "${REMOTE_URL}" || true
-
-            say "Installing Newelle. This can take a few minutes..."
-            local attempt
-            for attempt in 1 2 3; do
-              if flatpak install --user -y --noninteractive flathub "${APP_ID}"; then
-                return 0
-              fi
-              warn "Attempt ${attempt} failed. Retrying in 5 seconds..."
-              sleep 5
-            done
-            return 1
-          }
-
-          case "${MODE}" in
-            --install)
-              ;;
-            --launch-mini)
-              if is_installed; then
-                exec flatpak run "${APP_ID}" --mini
-              fi
-              MODE="--install"
-              ;;
-            --auto)
-              [ -f "${CONF_DIR}/first_boot_done" ] || exit 0
-              is_installed && exit 0
-              is_live && exit 0
-              command -v flatpak >/dev/null 2>&1 || exit 0
-              sleep 25
-              if command -v kdialog >/dev/null 2>&1; then
-                kdialog --title "OneOS" --dontagain "oneosrc:newelle_prompt" \
-                  --yesno "Newelle, the full AI assistant app for OneOS, is not installed yet.\n\nInstall and set it up now? (needs internet)" || exit 0
-              fi
-              MODE="--install"
-              ;;
-            *)
-              echo "Usage: oneos-newelle-setup [--install|--auto|--launch-mini]" >&2
-              exit 2
-              ;;
-          esac
-
-          relaunch_in_terminal "${MODE}"
-          exec > >(tee -a "${LOG_FILE}") 2>&1
-
-          printf '\033[1;36m'
-          echo "=============================================="
-          echo "   OneOS  |  Newelle AI assistant setup"
-          echo "=============================================="
-          printf '\033[0m'
-
-          if is_installed; then
-            say "Newelle is already installed."
-          else
-            install_newelle
-            rc=$?
-            if [ "${rc}" -eq 2 ]; then
-              sleep 6
-              exit 0
-            fi
-            if [ "${rc}" -ne 0 ]; then
-              warn "Newelle could not be installed. Details: ${LOG_FILE}"
-              notify "Newelle setup failed" "Check your connection and try again from OneOS Welcome." dialog-warning
-              pause_close
-              exit 1
-            fi
-            rm -f "${DONE_FLAG}"
-          fi
-
-          if [ ! -f "${DONE_FLAG}" ]; then
-            configure_newelle
-            date -u +%FT%TZ > "${DONE_FLAG}"
-          fi
-
-          notify "Newelle is ready" "Starting it now. Press Ctrl+Alt+N any time for the quick window." dialog-information
-          say "Starting Newelle. Its own first-run setup will guide you from here."
-          say "Tip: press Ctrl+Alt+N any time for the quick window."
-          launch_newelle
-          sleep 4
-          exit 0
-          NEWELLE_SH_EOF
-
           # ------------------------------------------------------------------
           # OneOS Welcome: first-boot wizard + everyday hub (/usr/local/bin/oneos-welcome)
           # ------------------------------------------------------------------
@@ -1833,7 +2074,7 @@ jobs:
           import oneos_ui as ui  # noqa: E402
 
           from PyQt6.QtCore import Qt, QUrl  # noqa: E402
-          from PyQt6.QtGui import QDesktopServices  # noqa: E402
+          from PyQt6.QtGui import QDesktopServices, QIcon  # noqa: E402
           from PyQt6.QtWidgets import (  # noqa: E402
               QApplication,
               QButtonGroup,
@@ -2006,6 +2247,18 @@ jobs:
                   self.accept()
 
 
+          SHORTCUT_TEXT = (
+              "Super+Space: Gemini Assistant (chat)\n"
+              "Super+Shift+L: Gemini Live, talk about your screen\n"
+              "Super+Shift+C: Circle to Search\n"
+              "Super+Shift+D: Read my screen aloud\n"
+              "Super+Shift+A: Ask Gemini by voice\n"
+              "Super+Shift+X: What is wrong on my screen?\n"
+              "Super+Shift+E / Y / F / T: explain, summarize, fix or translate the highlighted text\n"
+              "Super+E Files, Super+B Brave, Super+I Settings, Ctrl+Shift+Esc System Monitor"
+          )
+
+
           class Tile(QPushButton):
               def __init__(self, icon, title, desc):
                   super().__init__()
@@ -2015,9 +2268,16 @@ jobs:
                   layout = QHBoxLayout(self)
                   layout.setContentsMargins(16, 10, 14, 10)
                   layout.setSpacing(14)
-                  self.icon_lbl = QLabel(icon)
+                  self.icon_lbl = QLabel()
                   self.icon_lbl.setObjectName("TileIcon")
-                  self.icon_lbl.setFixedWidth(34)
+                  self.icon_lbl.setFixedWidth(40)
+                  # "theme:oneos-live|fallback" shows a themed icon, or the fallback text when the icon is missing
+                  name, _, fallback = icon.partition("|")
+                  pixmap = QIcon.fromTheme(name[6:]).pixmap(36, 36) if name.startswith("theme:") else None
+                  if pixmap is not None and not pixmap.isNull():
+                      self.icon_lbl.setPixmap(pixmap)
+                  else:
+                      self.icon_lbl.setText(fallback or icon)
                   column = QVBoxLayout()
                   column.setSpacing(2)
                   self.title_lbl = QLabel(title)
@@ -2102,7 +2362,7 @@ jobs:
                   if index == 3:
                       self.refresh_tiles()
 
-              def finish_wizard(self, install_newelle=True):
+              def finish_wizard(self):
                   ui.CONF_DIR.mkdir(parents=True, exist_ok=True)
                   ui.FIRST_BOOT_FLAG.write_text("done\n", encoding="utf-8")
                   if not ui.STARTUP_FLAG.exists():
@@ -2111,14 +2371,6 @@ jobs:
                   self.hub_title.setText("You're all set \U0001F389")
                   self.set_status("Press Super+Space any time to ask Gemini.")
                   self.go(3)
-                  if install_newelle:
-                      self.start_newelle_setup()
-
-              def start_newelle_setup(self):
-                  if launch([ui.NEWELLE_SETUP, "--install"]):
-                      self.set_status("Setting up Newelle in a terminal window...")
-                  else:
-                      self.set_status("Could not start the Newelle setup.")
 
               def closeEvent(self, event):
                   try:
@@ -2140,9 +2392,12 @@ jobs:
                   layout.setSpacing(12)
                   logo = QLabel("\u2726")
                   logo.setObjectName("Logo")
+                  logo_icon = QIcon.fromTheme("oneos")
+                  if not logo_icon.isNull():
+                      logo.setPixmap(logo_icon.pixmap(88, 88))
                   title = QLabel("Welcome to OneOS")
                   title.setObjectName("H1")
-                  sub = QLabel("Debian 13 \u00b7 KDE Plasma \u00b7 built-in Gemini AI \u00b7 Newelle\nVersion " + self.version)
+                  sub = QLabel("Debian 13 \u00b7 KDE Plasma \u00b7 built-in Gemini AI\nVersion " + self.version)
                   sub.setObjectName("Sub")
                   for widget in (logo, title, sub):
                       widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2168,7 +2423,7 @@ jobs:
 
                   skip = QPushButton("Skip setup, I'll explore on my own")
                   skip.setObjectName("Link")
-                  skip.clicked.connect(lambda: self.finish_wizard(False))
+                  skip.clicked.connect(lambda: self.finish_wizard())
                   layout.addWidget(skip, alignment=Qt.AlignmentFlag.AlignHCenter)
                   return page
 
@@ -2310,24 +2565,19 @@ jobs:
                   pl.addWidget(self.wizard_key)
                   layout.addWidget(panel)
 
-                  newelle = QFrame()
-                  newelle.setObjectName("Panel")
-                  nl = QVBoxLayout(newelle)
-                  nl.setContentsMargins(18, 14, 18, 14)
-                  nl.setSpacing(6)
-                  nhead = QLabel("\U0001F4AC  Newelle  \u00b7  full AI assistant app")
-                  nhead.setObjectName("CardName")
-                  nnote = QLabel(
-                      "When you press Finish, OneOS downloads and sets up Newelle for you (needs internet). "
-                      "It supports chats, documents, voice and terminal commands, and works with Gemini, "
-                      "OpenAI, Ollama and more. Add your key in Newelle's own setup. "
-                      "Quick window: Ctrl+Alt+N."
-                  )
-                  nnote.setObjectName("Muted")
-                  nnote.setWordWrap(True)
-                  nl.addWidget(nhead)
-                  nl.addWidget(nnote)
-                  layout.addWidget(newelle)
+                  keys = QFrame()
+                  keys.setObjectName("Panel")
+                  kl = QVBoxLayout(keys)
+                  kl.setContentsMargins(18, 14, 18, 14)
+                  kl.setSpacing(6)
+                  khead = QLabel("\u2328\ufe0f  Your Gemini shortcuts")
+                  khead.setObjectName("CardName")
+                  knote = QLabel(SHORTCUT_TEXT)
+                  knote.setObjectName("Muted")
+                  knote.setWordWrap(True)
+                  kl.addWidget(khead)
+                  kl.addWidget(knote)
+                  layout.addWidget(keys)
                   layout.addStretch()
 
                   nav = QHBoxLayout()
@@ -2336,7 +2586,7 @@ jobs:
                   back.clicked.connect(lambda: self.go(1))
                   skip = QPushButton("Skip for now")
                   skip.setObjectName("Link")
-                  skip.clicked.connect(lambda: self.finish_wizard(True))
+                  skip.clicked.connect(lambda: self.finish_wizard())
                   done = QPushButton("Finish  \u2713")
                   done.setObjectName("Primary")
                   done.clicked.connect(self.save_key_and_finish)
@@ -2349,7 +2599,7 @@ jobs:
 
               def save_key_and_finish(self):
                   self.wizard_key.save()
-                  self.finish_wizard(True)
+                  self.finish_wizard()
 
               # ------------------------------------------------------------ page 3: hub
               def page_hub(self):
@@ -2359,7 +2609,7 @@ jobs:
 
                   self.hub_title = QLabel("OneOS Welcome")
                   self.hub_title.setObjectName("H2")
-                  sub = QLabel("Version " + self.version + "  \u00b7  Super+Space: Assistant   \u00b7   Super+Shift+C: Circle to Search   \u00b7   Super+Shift+E: Explain selection   \u00b7   Ctrl+Alt+N: Newelle")
+                  sub = QLabel("Version " + self.version + "  \u00b7  Super+Space: Assistant   \u00b7   Super+Shift+L: Gemini Live   \u00b7   Super+Shift+C: Circle to Search")
                   sub.setObjectName("Sub")
                   layout.addWidget(self.hub_title)
                   layout.addWidget(sub)
@@ -2367,12 +2617,16 @@ jobs:
 
                   self.tile_appearance = Tile("\U0001F3A8", "Appearance", "")
                   self.tile_appearance.clicked.connect(self.toggle_mode)
-                  self.tile_assistant = Tile("\u2726", "Gemini Assistant", "Ask anything  \u00b7  Super+Space")
+                  self.tile_assistant = Tile("theme:oneos-gemini|\u2726", "Gemini Assistant", "Ask anything  \u00b7  Super+Space")
                   self.tile_assistant.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-gemini-assistant.py"]))
-                  self.tile_circle = Tile("\u25ce", "Circle to Search", "Draw around anything  \u00b7  Super+Shift+C")
+                  self.tile_circle = Tile("theme:oneos-circle-search|\u25ce", "Circle to Search", "Draw around anything  \u00b7  Super+Shift+C")
                   self.tile_circle.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-circle-search"]))
-                  self.tile_newelle = Tile("\U0001F4AC", "Newelle AI", "")
-                  self.tile_newelle.clicked.connect(self.open_newelle)
+                  self.tile_live = Tile("theme:oneos-live|\U0001F399", "Gemini Live", "Talk about your screen  \u00b7  Super+Shift+L")
+                  self.tile_live.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-gemini-live"]))
+                  self.tile_read = Tile("theme:oneos-read-screen|\U0001F5A5", "Read my screen", "Gemini reads it aloud  \u00b7  Super+Shift+D")
+                  self.tile_read.clicked.connect(lambda: self.open_tool(["/usr/local/bin/oneos-gemini-live", "--mode", "read"]))
+                  self.tile_keys = Tile("\u2328\ufe0f", "Keyboard shortcuts", "All the Gemini hotkeys")
+                  self.tile_keys.clicked.connect(self.show_shortcuts_guide)
                   self.tile_key = Tile("\U0001F511", "Gemini API key", "")
                   self.tile_key.clicked.connect(self.edit_key)
                   if self.live:
@@ -2395,7 +2649,8 @@ jobs:
                   grid.setVerticalSpacing(12)
                   tiles = [
                       self.tile_appearance, self.tile_assistant,
-                      self.tile_circle, self.tile_newelle,
+                      self.tile_circle, self.tile_live,
+                      self.tile_read, self.tile_keys,
                       self.tile_key, self.tile_install,
                       self.tile_wine, self.tile_info,
                       self.tile_settings, self.tile_update,
@@ -2431,10 +2686,6 @@ jobs:
                       self.tile_key.set_texts("Gemini API key  \u2713", "Saved. Click to replace or test it")
                   else:
                       self.tile_key.set_texts("Gemini API key", "Not set. Click to add your free key")
-                  if ui.newelle_installed():
-                      self.tile_newelle.set_texts("Newelle AI  \u2713", "Open Newelle  \u00b7  quick window: Ctrl+Alt+N")
-                  else:
-                      self.tile_newelle.set_texts("Install Newelle AI", "Download and set up the full AI assistant")
 
               def toggle_mode(self):
                   new_mode = "obsidian" if ui.current_visual_mode() == "glass" else "glass"
@@ -2446,15 +2697,6 @@ jobs:
                   dialog = ApiKeyDialog(self)
                   dialog.exec()
                   self.refresh_tiles()
-
-              def open_newelle(self):
-                  if launch([ui.NEWELLE_SETUP, "--install"]):
-                      if ui.newelle_installed():
-                          self.set_status("Opening Newelle...")
-                      else:
-                          self.set_status("Setting up Newelle in a terminal window...")
-                  else:
-                      self.set_status("Could not start the Newelle setup.")
 
               def run_updates(self):
                   script = (
@@ -2481,6 +2723,9 @@ jobs:
                   else:
                       self.set_status("Could not start the installer.")
 
+              def show_shortcuts_guide(self):
+                  QMessageBox.information(self, "Gemini shortcuts", SHORTCUT_TEXT)
+
               def show_wine_guide(self):
                   QMessageBox.information(
                       self,
@@ -2498,6 +2743,7 @@ jobs:
               app = QApplication(sys.argv)
               app.setApplicationName("OneOS Welcome")
               app.setDesktopFileName("oneos-welcome")
+              app.setWindowIcon(QIcon.fromTheme("oneos"))
               first_boot = not ui.FIRST_BOOT_FLAG.exists()
               if "--autostart" in sys.argv and not first_boot and not ui.startup_enabled():
                   return 0
@@ -2510,14 +2756,918 @@ jobs:
               sys.exit(main())
           WELCOME_PY_EOF
 
+          cat <<'LIVE_PY_EOF' > config/includes.chroot/usr/local/bin/oneos-gemini-live
+          #!/usr/bin/env python3
+          """OneOS Gemini Live - talk to Gemini about whatever is on your screen.
+
+          Every question (typed or spoken) is sent together with a fresh screenshot, so Gemini sees what you see.
+          Replies are read aloud. Modes (see --help):
+            live    hands-free conversation about your screen          Super+Shift+L
+            voice   hands-free voice chat without the screen           Super+Shift+A
+            read    describe the screen and read the important text    Super+Shift+D
+            fix     explain the error or problem on the screen         Super+Shift+X
+          """
+          import argparse
+          import atexit
+          import base64
+          import os
+          import re
+          import shutil
+          import signal
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          sys.path.insert(0, "/usr/local/lib/oneos")
+          import oneos_ui as ui  # noqa: E402
+
+          from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QTimer  # noqa: E402
+          from PyQt6.QtGui import QColor, QIcon, QImage, QKeySequence, QPixmap, QShortcut  # noqa: E402
+          from PyQt6.QtWidgets import (  # noqa: E402
+              QApplication,
+              QCheckBox,
+              QFrame,
+              QGraphicsDropShadowEffect,
+              QHBoxLayout,
+              QLabel,
+              QLineEdit,
+              QProgressBar,
+              QPushButton,
+              QScrollArea,
+              QVBoxLayout,
+              QWidget,
+          )
+
+          PID_FILE = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "oneos-gemini-live.pid"
+          WELCOME = "/usr/local/bin/oneos-welcome"
+          CARD_RADIUS = 28
+          KEEP_SCREENSHOTS = 2      # older screenshots are dropped from the history to keep requests small
+          KEEP_MESSAGES = 18
+          MAX_QUIET_ROUNDS = 2      # hands-free stops after this many silent listening rounds in a row
+
+          LIVE_PROMPT = (
+              ui.SYSTEM_PROMPT
+              + " You are in LIVE mode: the user talks to you and each message comes with a screenshot of their screen "
+              "taken at that moment, so you can see what they see. Answer the question about the screen directly. "
+              "Keep replies short and conversational, 1 to 4 sentences, because they are read aloud. "
+              "Do not use Markdown except fenced code blocks for commands. Never read out long URLs. "
+              "When the user's message is audio, begin with one line 'HEARD: <exact transcript>' and then your answer."
+          )
+
+          MODES = {
+              "live": {"screen": True, "listen": True, "speak": True, "ask": None, "title": "Gemini Live"},
+              "voice": {"screen": False, "listen": True, "speak": True, "ask": None, "title": "Ask by voice"},
+              "read": {
+                  "screen": True, "listen": False, "speak": True, "title": "Read my screen",
+                  "ask": "Describe what is on my screen in two or three plain sentences, then read out the most "
+                         "important text, such as a title, message or button labels. Keep it simple and clear.",
+              },
+              "fix": {
+                  "screen": True, "listen": False, "speak": False, "title": "What is wrong here?",
+                  "ask": "Look at my screen. If there is an error, warning or problem, explain what it means in plain "
+                         "words and give the exact steps or command to fix it. If everything looks fine, say what you "
+                         "see and ask what I need.",
+              },
+          }
+
+          STYLE = """
+          QFrame#Card { background-color: @CARD_BG@; border: 1px solid @BORDER@; border-radius: 28px; }
+          QLabel { color: #EEF2FF; background: transparent; }
+          QLabel#Title { font-size: 14px; font-weight: 700; }
+          QLabel#Muted { color: #8C98BA; font-size: 11px; }
+          QLabel#State { font-size: 12px; font-weight: 600; color: #C9D3F2; }
+          QLabel#Dot { font-size: 16px; }
+          QFrame#UserBubble { background-color: #4B6FE8; border-radius: 18px; }
+          QFrame#UserBubble QLabel { color: #FFFFFF; }
+          QFrame#AiBubble { background-color: rgba(255,255,255,16); border: 1px solid rgba(255,255,255,12); border-radius: 18px; }
+          QFrame#ShotRow { background-color: rgba(255,255,255,12); border-radius: 16px; }
+          QLineEdit { background-color: rgba(255,255,255,20); color: #FFFFFF; border: 1px solid rgba(255,255,255,26); border-radius: 18px; padding: 10px 16px; font-size: 13px; selection-background-color: #5882FF; }
+          QLineEdit:focus { border: 1px solid #7FA0FF; }
+          QPushButton { background-color: rgba(255,255,255,18); color: #EEF2FF; border: none; border-radius: 12px; padding: 6px 12px; font-weight: 600; }
+          QPushButton:hover { background-color: rgba(255,255,255,36); }
+          QPushButton#Mic { background-color: #5882FF; color: #FFFFFF; border-radius: 22px; min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px; font-size: 18px; padding: 0; }
+          QPushButton#Mic:hover { background-color: #6F95FF; }
+          QPushButton#MicOn { background-color: #EF4444; color: #FFFFFF; border-radius: 22px; min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px; font-size: 18px; padding: 0; }
+          QPushButton#Primary { background-color: #5882FF; color: #FFFFFF; padding: 9px 16px; border-radius: 16px; }
+          QPushButton#Primary:disabled { background-color: rgba(88,130,255,90); color: rgba(255,255,255,120); }
+          QPushButton#Ghost { background-color: transparent; color: #9AA6C8; padding: 2px 8px; font-weight: 500; font-size: 11px; }
+          QPushButton#Ghost:hover { color: #FFFFFF; }
+          QCheckBox { color: #C9D3F2; font-size: 11px; spacing: 6px; }
+          QCheckBox::indicator { width: 14px; height: 14px; border-radius: 5px; border: 1px solid rgba(255,255,255,80); background-color: rgba(255,255,255,20); }
+          QCheckBox::indicator:checked { background-color: #5882FF; border-color: #5882FF; }
+          QProgressBar { background-color: rgba(255,255,255,18); border: none; border-radius: 2px; max-height: 4px; min-height: 4px; }
+          QProgressBar::chunk { background-color: #4ADE80; border-radius: 2px; }
+          QScrollArea { background: transparent; border: none; }
+          QScrollArea > QWidget > QWidget { background: transparent; }
+          QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
+          QScrollBar::handle:vertical { background: rgba(255,255,255,50); border-radius: 4px; min-height: 28px; }
+          QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+          QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+          """
+
+          STATES = {
+              "idle": ("#9AA6C8", "Ready. Tap the mic or type."),
+              "listening": ("#EF4444", "Listening... just talk"),
+              "thinking": ("#F59E0B", "Looking at your screen..."),
+              "speaking": ("#4ADE80", "Speaking... tap the mic to interrupt"),
+          }
+
+
+          def stylesheet(glass):
+              card = "rgba(18, 22, 38, 170)" if glass else "rgb(16, 19, 32)"
+              border = "rgba(170, 200, 255, 60)" if glass else "rgb(54, 68, 112)"
+              return STYLE.replace("@CARD_BG@", card).replace("@BORDER@", border)
+
+
+          # ----------------------------------------------------------------- single instance
+          def _remove_pid():
+              try:
+                  if PID_FILE.read_text().split(":")[0] == str(os.getpid()):
+                      PID_FILE.unlink()
+              except OSError:
+                  pass
+
+
+          def single_instance(mode):
+              """Same hotkey again closes the window (toggle). A different mode replaces the open one."""
+              try:
+                  old_pid, old_mode = PID_FILE.read_text().strip().split(":", 1)
+                  old_pid = int(old_pid)
+                  os.kill(old_pid, 0)
+                  cmdline = Path("/proc/%d/cmdline" % old_pid).read_bytes()
+                  if b"oneos-gemini-live" in cmdline and old_pid != os.getpid():
+                      os.kill(old_pid, signal.SIGTERM)
+                      if old_mode == mode:
+                          return True
+              except (OSError, ValueError):
+                  pass
+              try:
+                  PID_FILE.write_text("%d:%s" % (os.getpid(), mode))
+                  atexit.register(_remove_pid)
+              except OSError:
+                  pass
+              return False
+
+
+          # ----------------------------------------------------------------- helpers
+          def image_to_b64(pixmap_or_image):
+              image = pixmap_or_image.toImage() if isinstance(pixmap_or_image, QPixmap) else pixmap_or_image
+              if image.isNull():
+                  return None
+              if max(image.width(), image.height()) > 1500:
+                  image = image.scaled(1500, 1500, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+              data = QByteArray()
+              buffer = QBuffer(data)
+              buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+              image.save(buffer, "JPEG", 82)
+              buffer.close()
+              return base64.b64encode(bytes(data.data())).decode("ascii")
+
+
+          def grab_screen():
+              app = QApplication.instance()
+              if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" and shutil.which("spectacle"):
+                  tmp = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "oneos-live-shot.png")
+                  subprocess.run(["spectacle", "-b", "-n", "-m", "-o", tmp], check=False, timeout=20)
+                  shot = QPixmap(tmp)
+                  try:
+                      os.remove(tmp)
+                  except OSError:
+                      pass
+                  if not shot.isNull():
+                      return shot
+              return app.primaryScreen().grabWindow(0)
+
+
+          def audio_to_b64(path):
+              with open(path, "rb") as handle:
+                  return base64.b64encode(handle.read()).decode("ascii")
+
+
+          HEARD = re.compile(r"^\s*HEARD:\s*(.*?)\s*(?:\n|$)", re.I)
+
+
+          def split_heard(text):
+              """('what the user said', 'the answer') from a reply that starts with a HEARD: line."""
+              match = HEARD.match(text)
+              if not match:
+                  return "", text
+              return match.group(1).strip().strip('"'), text[match.end():].strip() or text
+
+
+          def trim_history(history):
+              """Keep recent turns only and strip old screenshots and audio so requests stay small."""
+              history = history[-KEEP_MESSAGES:]
+              if history and history[0]["role"] != "user":
+                  history = history[1:]
+              shots = 0
+              for message in reversed(history):
+                  if message["role"] != "user":
+                      continue
+                  kept = []
+                  has_shot = any("inline_data" in p and p["inline_data"]["mime_type"].startswith("image/") for p in message["parts"])
+                  if has_shot:
+                      shots += 1
+                  for part in message["parts"]:
+                      blob = part.get("inline_data")
+                      if blob and blob["mime_type"].startswith("image/") and shots > KEEP_SCREENSHOTS:
+                          kept.append({"text": "[earlier screenshot omitted]"})
+                      else:
+                          kept.append(part)
+                  message["parts"] = kept
+              return history
+
+
+          # ----------------------------------------------------------------- widgets
+          class DragHeader(QFrame):
+              def mousePressEvent(self, event):
+                  if event.button() == Qt.MouseButton.LeftButton:
+                      handle = self.window().windowHandle()
+                      if handle is not None:
+                          handle.startSystemMove()
+                      event.accept()
+
+
+          class Bubble(QFrame):
+              def __init__(self, text, role):
+                  super().__init__()
+                  self.setObjectName("UserBubble" if role == "user" else "AiBubble")
+                  self.setMaximumWidth(360)
+                  layout = QVBoxLayout(self)
+                  layout.setContentsMargins(13, 9, 13, 9)
+                  self.label = QLabel()
+                  self.label.setWordWrap(True)
+                  self.label.setTextFormat(Qt.TextFormat.PlainText if role == "user" else Qt.TextFormat.MarkdownText)
+                  self.label.setText(text)
+                  self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                  layout.addWidget(self.label)
+
+              def set_text(self, text):
+                  self.label.setText(text)
+
+
+          class LiveWindow(QWidget):
+              def __init__(self, mode, ask=None, speak=None, listen=None, screen=None):
+                  super().__init__()
+                  cfg = MODES[mode]
+                  self.mode = mode
+                  self.title_text = cfg["title"]
+                  self.glass = ui.current_visual_mode() == "glass"
+                  self.history = []
+                  self.use_screen = cfg["screen"] if screen is None else screen
+                  self.use_speech = cfg["speak"] if speak is None else speak
+                  self.hands_free = cfg["listen"] if listen is None else listen
+                  self.initial_ask = ask if ask is not None else cfg["ask"]
+                  self.busy = False
+                  self.state = "idle"
+                  self.quiet_rounds = 0
+                  self.worker = None
+                  self.tts_worker = None
+                  self.recorder = None
+                  self.speaker = ui.Speaker()
+                  self.pending = None          # (text, audio_path, key) waiting for the screenshot
+                  self.voice_turn = False
+                  self.thinking = None
+                  self.have_voice = ui.record_command() is not None
+                  self.poll = QTimer(self)
+                  self.poll.timeout.connect(self._poll_speech)
+                  self._build()
+
+              # ------------------------------------------------------------ layout
+              def _build(self):
+                  self.setWindowTitle("Gemini Live")
+                  self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+                  self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                  self.setStyleSheet(stylesheet(self.glass))
+                  self.setFixedSize(468, 640)
+                  geo = QApplication.primaryScreen().availableGeometry()
+                  self.move(geo.x() + geo.width() - self.width() - 12, geo.y() + geo.height() - self.height() - 12)
+
+                  outer = QVBoxLayout(self)
+                  outer.setContentsMargins(24, 24, 24, 24)
+                  self.card = QFrame()
+                  self.card.setObjectName("Card")
+                  shadow = QGraphicsDropShadowEffect(self)
+                  shadow.setBlurRadius(46)
+                  shadow.setOffset(0, 12)
+                  shadow.setColor(QColor(0, 0, 0, 105))
+                  self.card.setGraphicsEffect(shadow)
+                  outer.addWidget(self.card)
+                  root = QVBoxLayout(self.card)
+                  root.setContentsMargins(16, 14, 16, 12)
+                  root.setSpacing(8)
+
+                  header = DragHeader()
+                  hl = QHBoxLayout(header)
+                  hl.setContentsMargins(0, 0, 0, 0)
+                  hl.setSpacing(8)
+                  self.dot = QLabel("●")
+                  self.dot.setObjectName("Dot")
+                  title = QLabel(self.title_text)
+                  title.setObjectName("Title")
+                  self.state_lbl = QLabel("")
+                  self.state_lbl.setObjectName("State")
+                  hl.addWidget(self.dot)
+                  hl.addWidget(title)
+                  hl.addStretch()
+                  new_btn = QPushButton("New")
+                  new_btn.setToolTip("Start a new conversation (Ctrl+L)")
+                  new_btn.clicked.connect(self.new_chat)
+                  close_btn = QPushButton("✕")
+                  close_btn.setFixedWidth(34)
+                  close_btn.setToolTip("Close (Esc)")
+                  close_btn.clicked.connect(self.close)
+                  for btn in (new_btn, close_btn):
+                      btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                      hl.addWidget(btn)
+                  root.addWidget(header)
+                  root.addWidget(self.state_lbl)
+
+                  self.level = QProgressBar()
+                  self.level.setRange(0, 100)
+                  self.level.setTextVisible(False)
+                  root.addWidget(self.level)
+
+                  toggles = QHBoxLayout()
+                  self.screen_box = QCheckBox("Sees my screen")
+                  self.screen_box.setChecked(self.use_screen)
+                  self.screen_box.toggled.connect(lambda on: setattr(self, "use_screen", on))
+                  self.speak_box = QCheckBox("Speak answers")
+                  self.speak_box.setChecked(self.use_speech)
+                  self.speak_box.toggled.connect(self._speak_toggled)
+                  self.hands_box = QCheckBox("Hands-free")
+                  self.hands_box.setChecked(self.hands_free)
+                  self.hands_box.toggled.connect(lambda on: setattr(self, "hands_free", on))
+                  for box in (self.screen_box, self.speak_box, self.hands_box):
+                      toggles.addWidget(box)
+                  toggles.addStretch()
+                  root.addLayout(toggles)
+
+                  self.shot_row = QFrame()
+                  self.shot_row.setObjectName("ShotRow")
+                  sl = QHBoxLayout(self.shot_row)
+                  sl.setContentsMargins(8, 6, 8, 6)
+                  self.thumb = QLabel()
+                  self.shot_note = QLabel("Last screenshot Gemini saw")
+                  self.shot_note.setObjectName("Muted")
+                  sl.addWidget(self.thumb)
+                  sl.addWidget(self.shot_note, 1)
+                  root.addWidget(self.shot_row)
+                  self.shot_row.hide()
+
+                  self.scroll = QScrollArea()
+                  self.scroll.setWidgetResizable(True)
+                  self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                  container = QWidget()
+                  self.msg_layout = QVBoxLayout(container)
+                  self.msg_layout.setContentsMargins(2, 2, 6, 2)
+                  self.msg_layout.setSpacing(8)
+                  self.msg_layout.addStretch()
+                  self.scroll.setWidget(container)
+                  bar = self.scroll.verticalScrollBar()
+                  bar.rangeChanged.connect(lambda _lo, hi: bar.setValue(hi))
+                  root.addWidget(self.scroll, 1)
+
+                  row = QHBoxLayout()
+                  row.setSpacing(8)
+                  self.mic_btn = QPushButton("\U0001F3A4")
+                  self.mic_btn.setObjectName("Mic")
+                  self.mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                  self.mic_btn.setToolTip("Talk / stop (Ctrl+M)")
+                  self.mic_btn.clicked.connect(self.toggle_mic)
+                  self.input = QLineEdit()
+                  self.input.setPlaceholderText("Or type a question about your screen...")
+                  self.input.returnPressed.connect(self.send_typed)
+                  self.send_btn = QPushButton("Ask")
+                  self.send_btn.setObjectName("Primary")
+                  self.send_btn.clicked.connect(self.send_typed)
+                  row.addWidget(self.mic_btn)
+                  row.addWidget(self.input, 1)
+                  row.addWidget(self.send_btn)
+                  root.addLayout(row)
+
+                  self.footer = QLabel("Esc closes   ·   Ctrl+M mic   ·   Ctrl+L new chat")
+                  self.footer.setObjectName("Muted")
+                  self.footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                  root.addWidget(self.footer)
+
+                  QShortcut(QKeySequence("Escape"), self).activated.connect(self.close)
+                  QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self.new_chat)
+                  QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(self.toggle_mic)
+
+                  if not self.have_voice:
+                      self.mic_btn.setEnabled(False)
+                      self.mic_btn.setToolTip("No microphone tool found (install pulseaudio-utils)")
+                      self.hands_box.setChecked(False)
+                      self.hands_box.setEnabled(False)
+                  self.set_state("idle")
+                  self.input.setFocus()
+
+              # ------------------------------------------------------------ state
+              def set_state(self, name, text=None):
+                  self.state = name
+                  color, label = STATES[name]
+                  self.dot.setStyleSheet("color: " + color + "; font-size: 16px;")
+                  self.state_lbl.setText(text or label)
+                  self.mic_btn.setObjectName("MicOn" if name == "listening" else "Mic")
+                  self.mic_btn.setStyleSheet("")
+                  self.mic_btn.style().unpolish(self.mic_btn)
+                  self.mic_btn.style().polish(self.mic_btn)
+                  if name != "listening":
+                      self.level.setValue(0)
+
+              def _speak_toggled(self, on):
+                  self.use_speech = on
+                  if not on:
+                      self.speaker.stop()
+
+              def add_bubble(self, text, role):
+                  bubble = Bubble(text, role)
+                  row = QWidget()
+                  rl = QHBoxLayout(row)
+                  rl.setContentsMargins(0, 0, 0, 0)
+                  if role == "user":
+                      rl.addStretch()
+                      rl.addWidget(bubble)
+                  else:
+                      rl.addWidget(bubble)
+                      rl.addStretch()
+                  self.msg_layout.insertWidget(self.msg_layout.count() - 1, row)
+                  return bubble, row
+
+              def new_chat(self):
+                  if self.busy:
+                      return
+                  self.stop_everything()
+                  self.history = []
+                  while self.msg_layout.count() > 1:
+                      item = self.msg_layout.takeAt(0)
+                      if item.widget():
+                          item.widget().deleteLater()
+                  self.shot_row.hide()
+                  self.set_state("idle")
+                  self.input.setFocus()
+
+              # ------------------------------------------------------------ listening
+              def toggle_mic(self):
+                  if self.recorder is not None and self.recorder.isRunning():
+                      self.recorder.stop()   # sends what was said so far
+                      return
+                  if self.busy and self.state == "thinking":
+                      return
+                  self.speaker.stop()
+                  self.start_listening()
+
+              def start_listening(self):
+                  if not self.have_voice or self.busy:
+                      return
+                  self.set_state("listening")
+                  self.poll.stop()
+                  rec = ui.Recorder(hands_free=True)
+                  self.recorder = rec
+                  rec.level.connect(lambda v: self.level.setValue(min(100, int(v / 30))))
+                  rec.finished_wav.connect(lambda path, r=rec: self._heard(path, r))
+                  rec.start()
+
+              def _heard(self, path, rec):
+                  if rec is not self.recorder or self.state != "listening":
+                      if path:  # superseded or cancelled recording: discard it
+                          try:
+                              os.remove(path)
+                          except OSError:
+                              pass
+                      return
+                  self.recorder = None
+                  if not path:
+                      self.quiet_rounds += 1
+                      if self.hands_free and self.quiet_rounds < MAX_QUIET_ROUNDS and self.state == "listening":
+                          self.start_listening()
+                          return
+                      self.set_state("idle", "I did not hear anything. Tap the mic to try again.")
+                      self.quiet_rounds = 0
+                      return
+                  self.quiet_rounds = 0
+                  self.begin_turn(None, path)
+
+              # ------------------------------------------------------------ turns
+              def send_typed(self):
+                  text = self.input.text().strip()
+                  if not text or self.busy:
+                      return
+                  self.input.clear()
+                  self.speaker.stop()
+                  if self.recorder is not None:
+                      self.recorder.cancel()
+                      self.recorder = None
+                  self.begin_turn(text, None)
+
+              def begin_turn(self, text, audio_path, show_user=True):
+                  if self.busy:
+                      return
+                  key = ui.load_api_key()
+                  if not key:
+                      self.add_bubble(
+                          "**No Gemini API key yet.** Open **OneOS Welcome** and choose **Gemini API key**. It is free from Google AI Studio.",
+                          "ai",
+                      )
+                      btn = QPushButton("Open OneOS Welcome")
+                      btn.setObjectName("Primary")
+                      btn.clicked.connect(lambda: subprocess.Popen([WELCOME], start_new_session=True))
+                      self.msg_layout.insertWidget(self.msg_layout.count() - 1, btn, alignment=Qt.AlignmentFlag.AlignLeft)
+                      self.set_state("idle")
+                      return
+                  self.busy = True
+                  self.send_btn.setEnabled(False)
+                  self.pending = (text, audio_path, key)
+                  self.voice_turn = bool(audio_path)
+                  self.set_state("thinking", "Looking at your screen..." if self.use_screen else "Thinking...")
+                  if text and show_user:
+                      self.add_bubble(text, "user")
+                  if self.use_screen:
+                      self.hide()
+                      QTimer.singleShot(260, self._capture_and_send)
+                  else:
+                      self._dispatch(None)
+
+              def _capture_and_send(self):
+                  shot = grab_screen()
+                  self.show()
+                  self.raise_()
+                  self.activateWindow()
+                  b64 = image_to_b64(shot)
+                  if b64:
+                      self.thumb.setPixmap(shot.scaledToHeight(40, Qt.TransformationMode.SmoothTransformation))
+                      self.shot_row.show()
+                  self._dispatch(b64)
+
+              def _dispatch(self, shot_b64):
+                  text, audio_path, key = self.pending
+                  self.pending = None
+                  parts = []
+                  if shot_b64:
+                      parts.append({"inline_data": {"mime_type": "image/jpeg", "data": shot_b64}})
+                  if audio_path:
+                      try:
+                          parts.append({"inline_data": {"mime_type": "audio/wav", "data": audio_to_b64(audio_path)}})
+                      except OSError:
+                          pass
+                      finally:
+                          try:
+                              os.remove(audio_path)
+                          except OSError:
+                              pass
+                      parts.append({"text": "(The user spoke this question. Answer it" + (" about the screenshot." if shot_b64 else ".") + ")"})
+                  else:
+                      parts.append({"text": text or "What is on my screen?"})
+                  self.history.append({"role": "user", "parts": parts})
+                  self.history = trim_history(self.history)
+                  self.thinking = self.add_bubble("_Thinking..._", "ai")
+                  self.worker = ui.FuncWorker(ui.gemini_generate, list(self.history), key, None, LIVE_PROMPT)
+                  self.worker.done.connect(self._answered)
+                  self.worker.start()
+
+              def _answered(self, result):
+                  self.busy = False
+                  self.send_btn.setEnabled(True)
+                  if self.thinking is not None:
+                      self.thinking[1].deleteLater()
+                      self.thinking = None
+                  if isinstance(result, Exception):
+                      if self.history and self.history[-1]["role"] == "user":
+                          self.history.pop()
+                      self.add_bubble("⚠️ " + str(result), "ai")
+                      self.set_state("idle", "Something went wrong. Tap the mic or type to retry.")
+                      return
+                  heard, answer = split_heard(result)
+                  # Replace the audio in the history with its transcript so later turns stay small
+                  if self.history and self.history[-1]["role"] == "user":
+                      parts = [p for p in self.history[-1]["parts"] if "inline_data" not in p or p["inline_data"]["mime_type"].startswith("image/")]
+                      if heard:
+                          parts = [p for p in parts if not p.get("text", "").startswith("(The user spoke")]
+                          parts.append({"text": heard})
+                      self.history[-1]["parts"] = parts
+                      if heard:
+                          self.add_bubble(heard, "user")
+                  if self.voice_turn and not heard:
+                      self.add_bubble("\U0001F3A4 (voice question)", "user")
+                  self.history.append({"role": "model", "parts": [{"text": answer}]})
+                  self.add_bubble(answer, "ai")
+                  if self.use_speech:
+                      self.speak(answer)
+                  else:
+                      self.after_reply()
+
+              # ------------------------------------------------------------ speech output
+              def speak(self, text):
+                  self.set_state("speaking")
+                  key = ui.load_api_key()
+                  self.tts_worker = ui.FuncWorker(ui.tts_to_wav, text, key)
+                  self.tts_worker.done.connect(lambda res, t=text: self._voice_ready(res, t))
+                  self.tts_worker.start()
+
+              def _voice_ready(self, result, text):
+                  if not self.use_speech or self.state != "speaking":
+                      if isinstance(result, str):
+                          ui.Speaker._drop(result)
+                      return
+                  started = False
+                  if isinstance(result, str):
+                      started = self.speaker.play(result)
+                  if not started:
+                      started = self.speaker.say(text)  # offline voice
+                  if started:
+                      self.poll.start(200)
+                  else:
+                      self.after_reply()
+
+              def _poll_speech(self):
+                  if self.state != "speaking":
+                      self.poll.stop()
+                      return
+                  if not self.speaker.speaking():
+                      self.poll.stop()
+                      self.after_reply()
+
+              def after_reply(self):
+                  self.set_state("idle")
+                  if self.hands_free and self.have_voice and self.hands_box.isChecked():
+                      QTimer.singleShot(250, self.start_listening)
+                  else:
+                      self.input.setFocus()
+
+              # ------------------------------------------------------------ lifecycle
+              def stop_everything(self):
+                  self.poll.stop()
+                  self.speaker.stop()
+                  if self.recorder is not None:
+                      self.recorder.cancel()
+                      self.recorder.wait(1500)
+                      self.recorder = None
+
+              def closeEvent(self, event):
+                  self.stop_everything()
+                  super().closeEvent(event)
+                  QApplication.instance().quit()
+
+              def _apply_blur(self):
+                  if self.glass:
+                      ui.enable_blur_behind(self, self.card.geometry(), CARD_RADIUS)
+
+              def showEvent(self, event):
+                  super().showEvent(event)
+                  QTimer.singleShot(80, self._apply_blur)
+
+              def start(self):
+                  if self.initial_ask:
+                      shown = "Reading your screen..." if self.mode == "read" else self.initial_ask
+                      self.add_bubble(shown, "user")
+                      QTimer.singleShot(150, lambda: self.begin_turn(self.initial_ask, None, show_user=False))
+                  elif self.hands_free and self.have_voice:
+                      QTimer.singleShot(300, self.start_listening)
+
+
+          def main():
+              parser = argparse.ArgumentParser(description="OneOS Gemini Live")
+              parser.add_argument("--mode", choices=sorted(MODES), default="live")
+              parser.add_argument("--ask", default=None, help="Send this question as soon as the window opens")
+              parser.add_argument("--no-speak", action="store_true", help="Do not read answers aloud")
+              parser.add_argument("--no-listen", action="store_true", help="Do not start listening automatically")
+              parser.add_argument("--no-screen", action="store_true", help="Do not attach screenshots")
+              args = parser.parse_args()
+
+              if single_instance(args.mode):
+                  return 0
+              app = QApplication(sys.argv)
+              app.setApplicationName("Gemini Live")
+              app.setDesktopFileName("oneos-gemini-live")
+              app.setWindowIcon(QIcon.fromTheme("oneos-live"))
+              app.setQuitOnLastWindowClosed(False)  # the window hides itself while taking the screenshot
+              signal.signal(signal.SIGTERM, lambda *_: app.quit())
+              heartbeat = QTimer()
+              heartbeat.timeout.connect(lambda: None)
+              heartbeat.start(400)
+
+              window = LiveWindow(
+                  args.mode,
+                  ask=args.ask,
+                  speak=False if args.no_speak else None,
+                  listen=False if args.no_listen else None,
+                  screen=False if args.no_screen else None,
+              )
+              window.show()
+              window.raise_()
+              window.activateWindow()
+              window.start()
+              code = app.exec()
+              window.stop_everything()
+              _remove_pid()
+              sys.stdout.flush()
+              os._exit(code)  # skips Qt teardown while a request thread may still be running
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          LIVE_PY_EOF
+
           chmod 0755 \
             config/includes.chroot/usr/local/bin/oneos-apply-visual-mode \
             config/includes.chroot/usr/local/bin/oneos-gemini-assistant.py \
             config/includes.chroot/usr/local/bin/oneos-circle-search \
-            config/includes.chroot/usr/local/bin/oneos-newelle-setup \
+            config/includes.chroot/usr/local/bin/oneos-gemini-live \
             config/includes.chroot/usr/local/bin/oneos-welcome \
             config/includes.chroot/usr/local/bin/oneos-first-login \
             config/includes.chroot/usr/local/lib/oneos/live-autologin.sh
+
+          # OneOS icon set (scalable SVG, found by name from the hicolor theme)
+          mkdir -p config/includes.chroot/usr/share/icons/hicolor/scalable/apps
+          cat <<'ICON_ONEOS_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneos-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#5B8CFF"/><stop offset="1" stop-color="#8B5CF6"/>
+              </linearGradient>
+              <linearGradient id="oneos-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneos-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneos-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M32 9 C34.2 23 41 29.8 55 32 C41 34.2 34.2 41 32 55 C29.8 41 23 34.2 9 32 C23 29.8 29.8 23 32 9 Z" fill="#fff"/><circle cx="32" cy="32" r="3.2" fill="#6D7CFF"/></g>
+          </svg>
+          ICON_ONEOS_EOF
+          cat <<'ICON_ONEOS_GEMINI_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-gemini.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneosgemini-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#4F8BFF"/><stop offset="1" stop-color="#9B5CF6"/>
+              </linearGradient>
+              <linearGradient id="oneosgemini-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneosgemini-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneosgemini-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M32 9 C34.2 23 41 29.8 55 32 C41 34.2 34.2 41 32 55 C29.8 41 23 34.2 9 32 C23 29.8 29.8 23 32 9 Z" fill="#fff"/><path d="M50 8 C50.7 12.6 52.9 14.8 57.5 15.5 C52.9 16.2 50.7 18.4 50 23 C49.3 18.4 47.1 16.2 42.5 15.5 C47.1 14.8 49.3 12.6 50 8 Z" fill="#fff" opacity=".85"/></g>
+          </svg>
+          ICON_ONEOS_GEMINI_EOF
+          cat <<'ICON_ONEOS_CIRCLE_SEARCH_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-circle-search.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneoscirclesearch-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#22C7E8"/><stop offset="1" stop-color="#3B6CF6"/>
+              </linearGradient>
+              <linearGradient id="oneoscirclesearch-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneoscirclesearch-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneoscirclesearch-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M30 14 C18 13 11 22 12.5 31 C14 41 24 47 33 44.5 C43 41.5 47 31 43 22.5 C40.5 17.5 36 15 31 14.6" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M40 40 L52 52" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M50 8 C50.7 12.6 52.9 14.8 57.5 15.5 C52.9 16.2 50.7 18.4 50 23 C49.3 18.4 47.1 16.2 42.5 15.5 C47.1 14.8 49.3 12.6 50 8 Z" transform="translate(-17 15) scale(.9)" fill="#fff"/></g>
+          </svg>
+          ICON_ONEOS_CIRCLE_SEARCH_EOF
+          cat <<'ICON_ONEOS_LIVE_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-live.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneoslive-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#F0476B"/><stop offset="1" stop-color="#7C5CF6"/>
+              </linearGradient>
+              <linearGradient id="oneoslive-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneoslive-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneoslive-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M14 24 V16 Q14 14 16 14 H24 M40 14 H48 Q50 14 50 16 V24 M50 40 V48 Q50 50 48 50 H40 M24 50 H16 Q14 50 14 48 V40" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/><rect x="21" y="27" width="4.6" height="10" rx="2.3" fill="#fff"/><rect x="29.7" y="21" width="4.6" height="22" rx="2.3" fill="#fff"/><rect x="38.4" y="26" width="4.6" height="12" rx="2.3" fill="#fff"/></g>
+          </svg>
+          ICON_ONEOS_LIVE_EOF
+          cat <<'ICON_ONEOS_VOICE_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-voice.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneosvoice-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#8B5CF6"/><stop offset="1" stop-color="#3B82F6"/>
+              </linearGradient>
+              <linearGradient id="oneosvoice-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneosvoice-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneosvoice-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><rect x="25" y="11" width="14" height="25" rx="7" fill="#fff"/><path d="M18 30 C18 40 24 45 32 45 C40 45 46 40 46 30" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M32 45 V53 M25 53 H39" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></g>
+          </svg>
+          ICON_ONEOS_VOICE_EOF
+          cat <<'ICON_ONEOS_READ_SCREEN_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-read-screen.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneosreadscreen-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#14B8A6"/><stop offset="1" stop-color="#3B82F6"/>
+              </linearGradient>
+              <linearGradient id="oneosreadscreen-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneosreadscreen-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneosreadscreen-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><rect x="10" y="12" width="44" height="30" rx="5" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 22 H44 M20 29 H38 M24 52 H40 M32 42 V52" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+          </svg>
+          ICON_ONEOS_READ_SCREEN_EOF
+          cat <<'ICON_ONEOS_FIX_SCREEN_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-fix-screen.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneosfixscreen-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#F59E0B"/><stop offset="1" stop-color="#EF4444"/>
+              </linearGradient>
+              <linearGradient id="oneosfixscreen-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneosfixscreen-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneosfixscreen-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><rect x="10" y="12" width="44" height="30" rx="5" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 28 L29 35 L43 20" fill="none" stroke="#fff" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 52 H40 M32 42 V52" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+          </svg>
+          ICON_ONEOS_FIX_SCREEN_EOF
+          cat <<'ICON_ONEOS_EXPLAIN_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-explain.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneosexplain-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#06B6D4"/>
+              </linearGradient>
+              <linearGradient id="oneosexplain-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneosexplain-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneosexplain-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M32 10 C22 10 16 17 16 25 C16 31 19.5 34.5 22 38 C23 39.5 23.5 41 23.5 43 H40.5 C40.5 41 41 39.5 42 38 C44.5 34.5 48 31 48 25 C48 17 42 10 32 10 Z" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M26 50 H38 M28.5 56 H35.5" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M32 18 V26" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+          </svg>
+          ICON_ONEOS_EXPLAIN_EOF
+          cat <<'ICON_ONEOS_SUMMARIZE_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-summarize.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneossummarize-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#8B5CF6"/><stop offset="1" stop-color="#EC4899"/>
+              </linearGradient>
+              <linearGradient id="oneossummarize-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneossummarize-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneossummarize-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M14 18 H50 M14 29 H50 M14 40 H36" fill="none" stroke="#fff" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M50 8 C50.7 12.6 52.9 14.8 57.5 15.5 C52.9 16.2 50.7 18.4 50 23 C49.3 18.4 47.1 16.2 42.5 15.5 C47.1 14.8 49.3 12.6 50 8 Z" transform="translate(-4 24) scale(.95)" fill="#fff"/></g>
+          </svg>
+          ICON_ONEOS_SUMMARIZE_EOF
+          cat <<'ICON_ONEOS_FIX_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-fix.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneosfix-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#10B981"/><stop offset="1" stop-color="#3B82F6"/>
+              </linearGradient>
+              <linearGradient id="oneosfix-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneosfix-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneosfix-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M14 50 L16.5 40 L42 14.5 Q44 12.5 46 14.5 L49.5 18 Q51.5 20 49.5 22 L24 47.5 Z" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M38 19 L45 26" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M16.5 40 L24 47.5" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/></g>
+          </svg>
+          ICON_ONEOS_FIX_EOF
+          cat <<'ICON_ONEOS_TRANSLATE_EOF' > config/includes.chroot/usr/share/icons/hicolor/scalable/apps/oneos-translate.svg
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+            <defs>
+              <linearGradient id="oneostranslate-bg" x1="8" y1="4" x2="56" y2="62" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#6366F1"/><stop offset="1" stop-color="#14B8A6"/>
+              </linearGradient>
+              <linearGradient id="oneostranslate-gloss" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#oneostranslate-bg)"/>
+            <rect x="2" y="2" width="60" height="30" rx="16" fill="url(#oneostranslate-gloss)"/>
+            <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="15.25" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+            <g><path d="M12 22 H46 M38 13 L47 22 L38 31" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M52 42 H18 M26 33 L17 42 L26 51" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></g>
+          </svg>
+          ICON_ONEOS_TRANSLATE_EOF
 
           # Desktop entries -----------------------------------------------------------
           cat <<'AUTOSTART_EOF' > config/includes.chroot/etc/xdg/autostart/oneos-welcome.desktop
@@ -2526,25 +3676,11 @@ jobs:
           Name=OneOS Welcome
           Comment=Set up OneOS and explore its features
           Exec=/usr/local/bin/oneos-welcome --autostart
-          Icon=help-about
+          Icon=oneos
           Terminal=false
           OnlyShowIn=KDE;
           X-KDE-autostart-after=panel
           AUTOSTART_EOF
-
-          # Login-time retry: if Newelle is not installed yet (no network earlier, closed wizard,
-          # or installed from the live ISO) it asks once and offers to set it up.
-          cat <<'NEWELLE_AUTOSTART_EOF' > config/includes.chroot/etc/xdg/autostart/oneos-newelle-setup.desktop
-          [Desktop Entry]
-          Type=Application
-          Name=OneOS Newelle Setup
-          Comment=Offers to install the Newelle AI assistant after first-boot setup
-          Exec=/usr/local/bin/oneos-newelle-setup --auto
-          Icon=system-software-install
-          Terminal=false
-          OnlyShowIn=KDE;
-          X-KDE-autostart-after=panel
-          NEWELLE_AUTOSTART_EOF
 
           cat <<'WELCOME_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-welcome.desktop
           [Desktop Entry]
@@ -2552,7 +3688,7 @@ jobs:
           Name=OneOS Welcome
           Comment=Set up OneOS and explore its features
           Exec=/usr/local/bin/oneos-welcome
-          Icon=help-about
+          Icon=oneos
           Terminal=false
           Categories=System;Settings;
           WELCOME_DESKTOP_EOF
@@ -2563,10 +3699,36 @@ jobs:
           Name=OneOS Gemini Assistant
           Comment=Ask Gemini from anywhere
           Exec=/usr/local/bin/oneos-gemini-assistant.py
-          Icon=help-hint
+          Icon=oneos-gemini
           Terminal=false
           StartupNotify=false
           Categories=Utility;
+          Actions=Live;Voice;Read;Fix;Circle;
+
+          [Desktop Action Live]
+          Name=Gemini Live: talk about my screen
+          Exec=/usr/local/bin/oneos-gemini-live
+          Icon=oneos-live
+
+          [Desktop Action Voice]
+          Name=Ask Gemini by voice
+          Exec=/usr/local/bin/oneos-gemini-live --mode voice
+          Icon=oneos-voice
+
+          [Desktop Action Read]
+          Name=Read my screen aloud
+          Exec=/usr/local/bin/oneos-gemini-live --mode read
+          Icon=oneos-read-screen
+
+          [Desktop Action Fix]
+          Name=What is wrong on my screen?
+          Exec=/usr/local/bin/oneos-gemini-live --mode fix
+          Icon=oneos-fix-screen
+
+          [Desktop Action Circle]
+          Name=Circle to Search
+          Exec=/usr/local/bin/oneos-circle-search
+          Icon=oneos-circle-search
           GEMINI_DESKTOP_EOF
 
           cat <<'CTS_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-circle-search.desktop
@@ -2575,11 +3737,59 @@ jobs:
           Name=OneOS Circle to Search
           Comment=Draw around anything on screen and ask Gemini about it
           Exec=/usr/local/bin/oneos-circle-search
-          Icon=draw-freehand
+          Icon=oneos-circle-search
           Terminal=false
           StartupNotify=false
           Categories=Utility;
           CTS_DESKTOP_EOF
+
+          cat <<'ONEOS_LIVE_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-gemini-live.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Gemini Live
+          Comment=Talk to Gemini about whatever is on your screen
+          Exec=/usr/local/bin/oneos-gemini-live
+          Icon=oneos-live
+          Terminal=false
+          StartupNotify=false
+          Categories=Utility;
+          ONEOS_LIVE_DESKTOP_EOF
+
+          cat <<'ONEOS_VOICE_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-gemini-voice.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Ask Gemini by voice
+          Comment=Hands-free voice chat with Gemini
+          Exec=/usr/local/bin/oneos-gemini-live --mode voice
+          Icon=oneos-voice
+          Terminal=false
+          StartupNotify=false
+          Categories=Utility;
+          ONEOS_VOICE_DESKTOP_EOF
+
+          cat <<'ONEOS_READ_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-gemini-read-screen.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Read my screen aloud
+          Comment=Gemini describes the screen and reads out the important text
+          Exec=/usr/local/bin/oneos-gemini-live --mode read
+          Icon=oneos-read-screen
+          Terminal=false
+          StartupNotify=false
+          Categories=Utility;
+          ONEOS_READ_DESKTOP_EOF
+
+          cat <<'ONEOS_FIXSCREEN_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-gemini-fix-screen.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=What is wrong on my screen?
+          Comment=Gemini explains the error or problem it sees and how to fix it
+          Exec=/usr/local/bin/oneos-gemini-live --mode fix
+          Icon=oneos-fix-screen
+          Terminal=false
+          StartupNotify=false
+          Categories=Utility;
+          ONEOS_FIXSCREEN_DESKTOP_EOF
 
           # Hotkey-only actions on highlighted text (hidden from the app menu)
           cat <<'ONEOS_GEMINI_EXPLAIN_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-gemini-explain.desktop
@@ -2588,7 +3798,7 @@ jobs:
           Name=Explain selection with Gemini
           Comment=Highlight text anywhere, then use the hotkey
           Exec=/usr/local/bin/oneos-gemini-assistant.py --clipboard explain
-          Icon=help-hint
+          Icon=oneos-explain
           Terminal=false
           StartupNotify=false
           NoDisplay=true
@@ -2601,7 +3811,7 @@ jobs:
           Name=Summarize selection with Gemini
           Comment=Highlight text anywhere, then use the hotkey
           Exec=/usr/local/bin/oneos-gemini-assistant.py --clipboard summarize
-          Icon=help-hint
+          Icon=oneos-summarize
           Terminal=false
           StartupNotify=false
           NoDisplay=true
@@ -2614,7 +3824,7 @@ jobs:
           Name=Fix writing of selection with Gemini
           Comment=Highlight text anywhere, then use the hotkey
           Exec=/usr/local/bin/oneos-gemini-assistant.py --clipboard fix
-          Icon=help-hint
+          Icon=oneos-fix
           Terminal=false
           StartupNotify=false
           NoDisplay=true
@@ -2627,27 +3837,15 @@ jobs:
           Name=Translate selection with Gemini
           Comment=Highlight text anywhere, then use the hotkey
           Exec=/usr/local/bin/oneos-gemini-assistant.py --clipboard translate
-          Icon=help-hint
+          Icon=oneos-translate
           Terminal=false
           StartupNotify=false
           NoDisplay=true
           Categories=Utility;
           ONEOS_GEMINI_TRANSLATE_DESKTOP_EOF
 
-          # Newelle quick window: works before and after install (installs first if missing)
-          cat <<'NEWELLE_MINI_DESKTOP_EOF' > config/includes.chroot/usr/share/applications/oneos-newelle-mini.desktop
-          [Desktop Entry]
-          Type=Application
-          Name=Newelle Quick Window
-          Comment=Open the Newelle AI assistant quick window (Ctrl+Alt+N)
-          Exec=/usr/local/bin/oneos-newelle-setup --launch-mini
-          Icon=io.github.qwersyk.Newelle
-          Terminal=false
-          StartupNotify=false
-          Categories=Utility;
-          NEWELLE_MINI_DESKTOP_EOF
-
           # Global shortcuts. Circle to Search uses Super+Shift+C because Spectacle owns Super+Shift+S.
+          # Super+Shift+L Gemini Live (screen + voice), A voice chat, D read screen aloud, X what is wrong here.
           # Super+Shift+E/Y/F/T run Gemini on the highlighted text (or the clipboard).
           cat <<'SHORTCUTS_EOF' > config/includes.chroot/etc/xdg/kglobalshortcutsrc
           [services][oneos-gemini-assistant.desktop]
@@ -2656,8 +3854,17 @@ jobs:
           [services][oneos-circle-search.desktop]
           _launch=Meta+Shift+C,Meta+Shift+C,OneOS Circle to Search
 
-          [services][oneos-newelle-mini.desktop]
-          _launch=Ctrl+Alt+N,Ctrl+Alt+N,Newelle Quick Window
+          [services][oneos-gemini-live.desktop]
+          _launch=Meta+Shift+L,Meta+Shift+L,Gemini Live
+
+          [services][oneos-gemini-voice.desktop]
+          _launch=Meta+Shift+A,Meta+Shift+A,Ask Gemini by voice
+
+          [services][oneos-gemini-read-screen.desktop]
+          _launch=Meta+Shift+D,Meta+Shift+D,Read my screen aloud
+
+          [services][oneos-gemini-fix-screen.desktop]
+          _launch=Meta+Shift+X,Meta+Shift+X,What is wrong on my screen?
 
           [services][oneos-gemini-explain.desktop]
           _launch=Meta+Shift+E,Meta+Shift+E,Explain selection with Gemini
@@ -2689,7 +3896,7 @@ jobs:
           #!/usr/bin/env bash
           set -uo pipefail
 
-          MARK="${HOME}/.config/oneos/first_login_v3"
+          MARK="${HOME}/.config/oneos/first_login_v4"
           mkdir -p "${HOME}/.config/oneos"
           [ -f "${MARK}" ] && exit 0
 
@@ -2703,7 +3910,10 @@ jobs:
             reg() { "${KWRITE}" --file kglobalshortcutsrc --group services --group "$1" --key _launch "$2,$2,$3"; }
             reg oneos-gemini-assistant.desktop "Meta+Space" "OneOS Gemini Assistant"
             reg oneos-circle-search.desktop "Meta+Shift+C" "OneOS Circle to Search"
-            reg oneos-newelle-mini.desktop "Ctrl+Alt+N" "Newelle Quick Window"
+            reg oneos-gemini-live.desktop "Meta+Shift+L" "Gemini Live"
+            reg oneos-gemini-voice.desktop "Meta+Shift+A" "Ask Gemini by voice"
+            reg oneos-gemini-read-screen.desktop "Meta+Shift+D" "Read my screen aloud"
+            reg oneos-gemini-fix-screen.desktop "Meta+Shift+X" "What is wrong on my screen?"
             reg oneos-gemini-explain.desktop "Meta+Shift+E" "Explain selection with Gemini"
             reg oneos-gemini-summarize.desktop "Meta+Shift+Y" "Summarize selection with Gemini"
             reg oneos-gemini-fix.desktop "Meta+Shift+F" "Fix writing of selection with Gemini"
@@ -2719,14 +3929,14 @@ jobs:
           DESK="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
           [ -n "${DESK}" ] || DESK="${HOME}/Desktop"
           mkdir -p "${DESK}"
-          for f in oneos-gemini-assistant oneos-circle-search oneos-welcome; do
+          for f in oneos-gemini-assistant oneos-gemini-live oneos-circle-search oneos-welcome; do
             if [ -f "/usr/share/applications/${f}.desktop" ]; then
               cp -n "/usr/share/applications/${f}.desktop" "${DESK}/${f}.desktop" || true
               chmod +x "${DESK}/${f}.desktop" || true
             fi
           done
 
-          # ---- 3. Pin Gemini Assistant and Circle to Search to the task manager ----
+          # ---- 3. Pin Gemini Assistant, Gemini Live and Circle to Search to the task manager ----
           for _ in $(seq 1 30); do
             dbus-send --session --dest=org.kde.plasmashell --type=method_call /PlasmaShell \
               org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1 && break
@@ -2734,7 +3944,7 @@ jobs:
           done
           dbus-send --session --dest=org.kde.plasmashell --type=method_call /PlasmaShell \
             org.kde.PlasmaShell.evaluateScript string:'
-          var add = ["applications:oneos-gemini-assistant.desktop", "applications:oneos-circle-search.desktop"];
+          var add = ["applications:oneos-gemini-assistant.desktop", "applications:oneos-gemini-live.desktop", "applications:oneos-circle-search.desktop"];
           var base = ["applications:org.kde.dolphin.desktop", "applications:org.kde.konsole.desktop", "applications:systemsettings.desktop", "preferred://browser"];
           panels().forEach(function (p) {
             p.widgets().forEach(function (w) {
@@ -2758,7 +3968,7 @@ jobs:
           Name=OneOS First Login Setup
           Comment=Registers OneOS hotkeys and launchers
           Exec=/usr/local/bin/oneos-first-login
-          Icon=preferences-desktop-keyboard-shortcut
+          Icon=oneos
           Terminal=false
           OnlyShowIn=KDE;
           X-KDE-autostart-after=panel
@@ -2863,8 +4073,7 @@ jobs:
           fi
           command -v kwriteconfig6 >/dev/null 2>&1 || echo "[OneOS] WARNING: kwriteconfig6 is missing; visual profiles will not apply"
 
-          # Flathub (system-wide) for the Software Center. Newelle itself is installed per-user
-          # after the first-boot wizard, so it is not baked into the ISO (keeps the ISO small).
+          # Flathub (system-wide) for the Software Center.
           flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
 
           # Brave Browser
@@ -2942,6 +4151,10 @@ jobs:
           fi
           ln -sf "${UNSQ}" /usr/local/bin/unsquashfs
           echo "[OneOS] unsquashfs OK at ${UNSQ}"
+
+          # Icon cache for the OneOS icon set (cosmetic, never fails the build)
+          gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+          update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 
           update-initramfs -u -k all || true
 
@@ -3126,12 +4339,14 @@ jobs:
 
             ### What's new in the experience
             - **First-boot wizard:** a guided setup for your look, your Gemini key and your shortcuts, with a one-click **Install to disk** option in the live session.
-            - **Newelle AI, installed for you:** when the wizard finishes, OneOS downloads **Newelle** from Flathub, applies sensible permissions (host command access, home folder) and Konsole as its terminal, then starts it so Newelle's own first-run setup guides you. Open the quick window any time with `Ctrl + Alt + N`. If you were offline or skipped, OneOS offers to set it up again at your next login.
             - **OneOS Welcome hub:** one window for appearance, AI, software, updates, Wine and system tools. Optional at login.
             - **OneOS Assistant (`Super + Space`):** a Spotlight-style Gemini chat with conversation history, Markdown answers, copy buttons, clipboard quick actions and friendly error messages.
             - **Circle to Search (`Super + Shift + C`):** draw freely around anything on screen, then ask Gemini about it.
+            - **Gemini Live (`Super + Shift + L`):** talk to Gemini about whatever is on your screen. Every question, spoken or typed, goes with a fresh screenshot and the answer is read aloud in a natural Gemini voice (offline espeak-ng fallback). Hands-free: it listens, answers, then listens again. Also `Super + Shift + A` (voice chat), `Super + Shift + D` (read my screen aloud) and `Super + Shift + X` (explain the error on screen).
+            - **Always-current Gemini:** the default is `gemini-3.8-flash`. OneOS asks Google which models your key can use, remembers the best one, retries when a model is overloaded and switches automatically when one is retired.
+            - **Icons:** a matching OneOS icon set for Welcome, the Assistant, Circle to Search, Gemini Live and every hotkey action.
             - **Two visual profiles:** ✨ Liquid Glass (maximum KWin blur with film grain, translucent floating panel, launcher, notifications and almost every window, softer borders, rounder corners, aurora wallpaper) and ⚡ Sleek Obsidian (matte, zero GPU overhead), switchable live without logging out.
-            - **Shortcuts:** `Super + Space` (Gemini chat), `Super + Shift + C` (Circle to Search), `Ctrl + Alt + N` (Newelle), `Super + Shift + E / Y / F / T` (explain, summarize, fix or translate highlighted text with Gemini), `Super + E` (Files), `Super + B` (Brave), `Super + I` (System Settings) and `Ctrl + Shift + Esc` (System Monitor) are registered for every user at first login, with desktop icons and taskbar pins for the Assistant and Circle to Search.
+            - **Shortcuts:** `Super + Space` (Gemini chat), `Super + Shift + C` (Circle to Search), `Super + Shift + E / Y / F / T` (explain, summarize, fix or translate highlighted text with Gemini), `Super + E` (Files), `Super + B` (Brave), `Super + I` (System Settings) and `Ctrl + Shift + Esc` (System Monitor) are registered for every user at first login, with desktop icons and taskbar pins for the Assistant and Circle to Search.
             - **Out-of-the-box polish:** Inter font, Papirus-Dark icons, blue accent, audio, Bluetooth, Wi-Fi, Flatpak/Flathub and Software Center.
 
             ### Fixed in this release
@@ -3142,10 +4357,6 @@ jobs:
             - KDE Plasma (`sddm`, `kwin-x11`, `dolphin`, `konsole`, Kvantum) with XFCE fully removed
             - Multi-arch Wine (`amd64` + `i386`), Winetricks, Lutris, Brave Browser, Calamares installer, VM guest drivers
             - ZRAM (`zstd`), tuned `sysctl`, Baloo indexing disabled for low-end hardware
-
-            ### Notes
-            - Newelle needs an internet connection and about 4 GB of free space. In a small live session it is set up after you install OneOS to disk.
-            - Newelle is granted access to your home folder and can run commands outside its sandbox. Review what it suggests before approving commands.
 
             ### Verify your download
             ```
