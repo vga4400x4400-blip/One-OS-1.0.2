@@ -3476,7 +3476,6 @@ jobs:
             config/includes.chroot/usr/local/bin/oneos-circle-search \
             config/includes.chroot/usr/local/bin/oneos-gemini-live \
             config/includes.chroot/usr/local/bin/oneos-welcome \
-            config/includes.chroot/usr/local/bin/oneos-first-login \
             config/includes.chroot/usr/local/lib/oneos/live-autologin.sh
 
           # OneOS icon set (scalable SVG, found by name from the hicolor theme)
@@ -3961,6 +3960,7 @@ jobs:
 
           touch "${MARK}"
           FIRSTLOGIN_EOF
+          chmod 0755 config/includes.chroot/usr/local/bin/oneos-first-login
 
           cat <<'FIRSTLOGIN_AUTOSTART_EOF' > config/includes.chroot/etc/xdg/autostart/oneos-first-login.desktop
           [Desktop Entry]
